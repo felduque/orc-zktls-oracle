@@ -109,5 +109,17 @@ ENV PATH=/home/${USERNAME}/.sp1/bin:/home/${USERNAME}/.foundry/bin:/usr/local/go
     GOTOOLCHAIN=local \
     CC_riscv64im_succinct_zkvm_elf=/home/${USERNAME}/.sp1/bin/riscv64-unknown-elf-gcc
 
+# SP1 v6 runs the native executor as a child binary. By default the build script of
+# sp1-core-executor-runner builds it into the shared $CARGO_TARGET_DIR/sp1-native-bins for
+# EVERY feature set and embeds it with include_bytes!. A `profiling` build (portable executor,
+# so the binary is an empty `fn main() {}`) overwrites the native binary, and the next default
+# build embeds that stub. Every execute/prove then fails with "failed sending input to child:
+# Broken pipe". The fix is to prebuild the runner once and use the upstream override. The
+# runner version MUST equal the sp1-sdk version in every Cargo.lock (bump SP1_VERSION together).
+RUN set -eux; \
+    cargo install --locked --version "${SP1_VERSION#v}" sp1-core-executor-runner-binary; \
+    rm -rf /usr/local/cargo/registry/* /usr/local/cargo/git/*
+ENV SP1_CORE_RUNNER_OVERRIDE_BINARY=/usr/local/cargo/bin/sp1-core-executor-runner-binary
+
 WORKDIR /workspace
 CMD ["bash"]

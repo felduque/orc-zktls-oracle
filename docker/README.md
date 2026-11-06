@@ -55,6 +55,13 @@ docker compose run --rm dev cargo prove --version # one-off command
   not a reservation.
 - Guest cycle tracking (`cycle-tracker-report-*` markers) needs sp1-sdk's
   `profiling` feature in SP1 v6; without it the markers are ignored.
+- `SP1_CORE_RUNNER_OVERRIDE_BINARY` points at a native executor child binary
+  that the image prebuilds (`cargo install sp1-core-executor-runner-binary`).
+  Without it, sp1-core-executor-runner builds that binary per feature set into
+  the shared `$CARGO_TARGET_DIR/sp1-native-bins` and embeds it. A `profiling`
+  build then replaces it with an empty stub, and every later default
+  execute/prove fails instantly with `failed sending input to child: io error:
+  Broken pipe`. Keep its version equal to sp1-sdk's (both follow `SP1_VERSION`).
 - `docker compose down -v` deletes the volumes (caches and circuits).
 
 ## Another machine

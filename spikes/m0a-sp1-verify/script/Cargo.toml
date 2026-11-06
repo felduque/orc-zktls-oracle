@@ -17,6 +17,10 @@ hex = "0.4"
 [features]
 # SP1 v6 only honours `cycle-tracker-report-*` guest markers with sp1-sdk's
 # `profiling` feature (sp1-core-executor src/minimal/write.rs).
+# Safe to toggle in the shared target dir ONLY because the dev image sets
+# SP1_CORE_RUNNER_OVERRIDE_BINARY (see docker/Dockerfile). Without it, a `profiling`
+# build overwrites the native runner binary with a stub and breaks default builds
+# ("failed sending input to child: Broken pipe").
 profiling = ["sp1-sdk/profiling"]
 
 [build-dependencies]
