@@ -1,0 +1,5 @@
+target/
+**/target/
+.env
+# Secrets files contain the raw prover token by design. Never commit them.
+spikes/**/fixtures/secrets-*.bin

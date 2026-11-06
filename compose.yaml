@@ -1,0 +1,45 @@
+# Dev environment for the orc zk-TLS PoC. See docker/README.md.
+#
+# One-time setup so files created in the container are owned by you:
+#   printf 'DEV_UID=%s\nDEV_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+#   docker compose build
+# (Not `UID=$(id -u) docker compose build`: UID is a read-only bash variable,
+# so bash rejects that assignment and compose silently falls back to 1000.)
+name: orc
+
+services:
+  dev:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+      args:
+        UID: ${DEV_UID:-1000}
+        GID: ${DEV_GID:-1000}
+    image: orc-dev:sp1-v6.10.0
+    working_dir: /workspace
+    environment:
+      # Container builds go to a named volume, never to the host `target/` dirs.
+      CARGO_TARGET_DIR: /cargo-target
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/cargo-target
+      - go-mod:/home/dev/go/pkg/mod
+      # Only the Groth16/PLONK circuit artifacts. Never mount all of ~/.sp1:
+      # that would hide cargo-prove and the toolchains baked into the image.
+      - sp1-circuits:/home/dev/.sp1/circuits
+    # SP1 v6's native executor shares guest memory and trace buffers with a
+    # child process through POSIX shm (/dev/shm). Docker's 64 MB default makes
+    # the child die with SIGBUS ("Child native executor crashed ... signal: 7").
+    # This is a tmpfs cap, not a reservation; RAM is only used while in use.
+    shm_size: "16gb"
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  go-mod:
+  sp1-circuits:
