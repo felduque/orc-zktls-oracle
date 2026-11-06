@@ -1,0 +1,40 @@
+[package]
+name = "orc-prover"
+description = "orc prover: MPC-TLS to api.github.com with a notary, producing a redacted TLSNotary presentation"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "orc_prover"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orc"
+path = "src/main.rs"
+
+[dependencies]
+orc-core.workspace = true
+tlsn.workspace = true
+
+anyhow.workspace = true
+bincode.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+orc-notary.workspace = true
+tlsn-server-fixture-certs.workspace = true

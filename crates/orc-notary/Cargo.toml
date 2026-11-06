@@ -1,0 +1,25 @@
+[package]
+name = "orc-notary"
+description = "orc TCP notary: TLSNotary MPC-TLS verifier that signs secp256k1 attestations"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "orc-notary"
+path = "src/main.rs"
+
+[dependencies]
+orc-core.workspace = true
+tlsn.workspace = true
+
+anyhow.workspace = true
+bincode.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

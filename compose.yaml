@@ -20,6 +20,9 @@ services:
     environment:
       # Container builds go to a named volume, never to the host `target/` dirs.
       CARGO_TARGET_DIR: /cargo-target
+      # Secrets pass through from the host shell or .env (gitignored); empty if unset.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      ORC_NOTARY_KEY: ${ORC_NOTARY_KEY:-}
     volumes:
       - .:/workspace
       - cargo-registry:/usr/local/cargo/registry

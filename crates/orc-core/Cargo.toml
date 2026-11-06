@@ -1,0 +1,22 @@
+[package]
+name = "orc-core"
+description = "Guest-safe verification of an orc GitHub commit-count claim from a TLSNotary presentation"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Compiled into the SP1 guest (riscv64im-succinct-zkvm-elf) in M2.
+# Keep this list free of tokio, hyper, networking and anything std-OS specific.
+[dependencies]
+tlsn-core.workspace = true
+tlsn-attestation.workspace = true
+tlsn-formats.workspace = true
+rangeset.workspace = true
+httparse.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+tiny-keccak.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
