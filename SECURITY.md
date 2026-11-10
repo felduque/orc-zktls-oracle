@@ -16,11 +16,14 @@ The following are documented design limits of the PoC, not vulnerabilities:
   whoever holds it, and so does a remote prover;
 - the nullifier is linkable to the GitHub account (`databaseId`s are sequential);
 - TLS 1.2 only;
-- `sessionTime` comes from the notary's clock.
+- `sessionTime` is the prover's clock, accepted by the notary only within ±5 s of its own;
+- commits are attributed to accounts by email, so an email moved among accounts that already
+  existed at a campaign's snapshot can claim the same commits more than once.
 
 The reasoning and the planned fixes are in the README:
-[Trust model and privacy](README.md#trust-model-and-privacy) and
-[Known limitations and future work](README.md#known-limitations-and-future-work). Ideas on these
+[Trust model and privacy](README.md#trust-model-and-privacy),
+[Known limitations and future work](README.md#known-limitations-and-future-work) and the
+findings of the first review in [Security review](README.md#security-review). Ideas on these
 are welcome as regular issues.
 
 ## What to report

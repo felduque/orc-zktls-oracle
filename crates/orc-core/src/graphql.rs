@@ -4,18 +4,22 @@ use serde::{Deserialize, Serialize};
 
 /// The one query orc proves. `$a` is the viewer's node id, so the commit
 /// count is for the token owner; [`crate::verify`] checks `$a` equals the
-/// `viewer.id` the server returned.
-pub const GRAPHQL_QUERY: &str = "query($o:String!,$n:String!,$a:ID!){viewer{login databaseId id} repository(owner:$o,name:$n){databaseId defaultBranchRef{name target{... on Commit{oid history(author:{id:$a},first:1){totalCount}}}}}}";
+/// `viewer.id` the server returned. `$u` is the snapshot (`until`, a
+/// `GitTimestamp`): only commits authored up to it count, and
+/// `viewer.createdAt` lets the verifier require an account older than it.
+pub const GRAPHQL_QUERY: &str = "query($o:String!,$n:String!,$a:ID!,$u:GitTimestamp!){viewer{login databaseId id createdAt} repository(owner:$o,name:$n){databaseId defaultBranchRef{name target{... on Commit{oid history(author:{id:$a},until:$u,first:1){totalCount}}}}}}";
 
 /// The canonical, byte-exact JSON request body:
-/// `{"query":"<GRAPHQL_QUERY>","variables":{"o":<owner>,"n":<name>,"a":<viewer_node_id>}}`.
+/// `{"query":"<GRAPHQL_QUERY>","variables":{"o":<owner>,"n":<name>,"a":<viewer_node_id>,"u":<until>}}`.
 ///
-/// No whitespace; values are JSON string literals escaped exactly like
-/// `serde_json` does. The verifier recomputes this from the guest input and
-/// the authenticated `viewer.id` and compares bytes, so any other body
-/// (different variables, extra fields, different query) is rejected.
-pub fn graphql_body(owner: &str, name: &str, viewer_node_id: &str) -> String {
-    let mut body = String::with_capacity(GRAPHQL_QUERY.len() + 64);
+/// `until` is the snapshot as `YYYY-MM-DDTHH:MM:SSZ`
+/// ([`crate::time::format_utc`]). No whitespace; values are JSON string
+/// literals escaped exactly like `serde_json` does. The verifier recomputes
+/// this from the guest input and the authenticated `viewer.id` and compares
+/// bytes, so any other body (different variables, extra fields, different
+/// query) is rejected.
+pub fn graphql_body(owner: &str, name: &str, viewer_node_id: &str, until: &str) -> String {
+    let mut body = String::with_capacity(GRAPHQL_QUERY.len() + 96);
     body.push_str(r#"{"query":"#);
     push_json_string(&mut body, GRAPHQL_QUERY);
     body.push_str(r#","variables":{"o":"#);
@@ -24,6 +28,8 @@ pub fn graphql_body(owner: &str, name: &str, viewer_node_id: &str) -> String {
     push_json_string(&mut body, name);
     body.push_str(r#","a":"#);
     push_json_string(&mut body, viewer_node_id);
+    body.push_str(r#","u":"#);
+    push_json_string(&mut body, until);
     body.push_str("}}");
     body
 }
@@ -84,6 +90,9 @@ pub struct Viewer {
     pub database_id: u64,
     /// GraphQL node id; must equal the `$a` variable in the request body.
     pub id: String,
+    /// Account creation time, `YYYY-MM-DDTHH:MM:SSZ` (a GraphQL `DateTime`);
+    /// must be before the snapshot.
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,26 +133,28 @@ pub fn parse_response(body: &[u8]) -> Result<GraphqlResponse, serde_json::Error>
 mod tests {
     use super::*;
 
-    const VALID: &str = r#"{"data":{"viewer":{"login":"octo","databaseId":583231,"id":"U_kgDOAAA"},"repository":{"databaseId":1300192,"defaultBranchRef":{"name":"main","target":{"oid":"abc","history":{"totalCount":42}}}}}}"#;
+    const VALID: &str = r#"{"data":{"viewer":{"login":"octo","databaseId":583231,"id":"U_kgDOAAA","createdAt":"2015-06-01T12:34:56Z"},"repository":{"databaseId":1300192,"defaultBranchRef":{"name":"main","target":{"oid":"abc","history":{"totalCount":42}}}}}}"#;
 
     #[test]
     fn body_matches_plan_template_byte_for_byte() {
-        let body = graphql_body("tlsnotary", "tlsn", "U_kgDOAAA");
+        let body = graphql_body("tlsnotary", "tlsn", "U_kgDOAAA", "2026-01-01T00:00:00Z");
         let expected = concat!(
-            r#"{"query":"query($o:String!,$n:String!,$a:ID!){viewer{login databaseId id} repository(owner:$o,name:$n){databaseId defaultBranchRef{name target{... on Commit{oid history(author:{id:$a},first:1){totalCount}}}}}}","#,
-            r#""variables":{"o":"tlsnotary","n":"tlsn","a":"U_kgDOAAA"}}"#
+            r#"{"query":"query($o:String!,$n:String!,$a:ID!,$u:GitTimestamp!){viewer{login databaseId id createdAt} repository(owner:$o,name:$n){databaseId defaultBranchRef{name target{... on Commit{oid history(author:{id:$a},until:$u,first:1){totalCount}}}}}}","#,
+            r#""variables":{"o":"tlsnotary","n":"tlsn","a":"U_kgDOAAA","u":"2026-01-01T00:00:00Z"}}"#
         );
         assert_eq!(body, expected);
     }
 
     #[test]
     fn body_is_valid_json_with_the_expected_variables() {
-        let body = graphql_body("o", "n", "a");
+        let body = graphql_body("o", "n", "a", "u");
         let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(v["query"], GRAPHQL_QUERY);
         assert_eq!(v["variables"]["o"], "o");
         assert_eq!(v["variables"]["n"], "n");
         assert_eq!(v["variables"]["a"], "a");
+        assert_eq!(v["variables"]["u"], "u");
+        assert_eq!(v["variables"].as_object().map(|o| o.len()), Some(4));
     }
 
     #[test]
@@ -196,9 +207,17 @@ mod tests {
 
     #[test]
     fn null_repository_is_rejected() {
-        let null_repo =
-            r#"{"data":{"viewer":{"login":"o","databaseId":1,"id":"U"},"repository":null}}"#;
+        let null_repo = r#"{"data":{"viewer":{"login":"o","databaseId":1,"id":"U","createdAt":"2015-06-01T12:34:56Z"},"repository":null}}"#;
         assert!(parse_response(null_repo.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn missing_or_null_created_at_is_rejected() {
+        let missing = VALID.replacen(",\"createdAt\":\"2015-06-01T12:34:56Z\"", "", 1);
+        assert_ne!(missing, VALID);
+        assert!(parse_response(missing.as_bytes()).is_err());
+        let null = VALID.replacen("\"2015-06-01T12:34:56Z\"", "null", 1);
+        assert!(parse_response(null.as_bytes()).is_err());
     }
 
     #[test]

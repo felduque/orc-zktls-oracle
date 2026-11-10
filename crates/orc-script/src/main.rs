@@ -8,7 +8,7 @@
 //!
 //! Subcommands (run inside the dev container, from crates/orc-script):
 //!   execute --presentation <bin> --input <json> [--test-ca]
-//!   vkey [--test-ca] [--elf <path>]
+//!   vkey [--test-ca | --env] [--elf <path>]
 //!   prove --system groth16|plonk|core|compressed --presentation <bin> --input <json> [--test-ca] [--out <json>]
 //!   fixture --mock [--production] [--presentation <bin>] [--input <json>] [--out <json>]
 //!
@@ -72,6 +72,10 @@ enum Command {
         /// TEST ONLY: the test-ca ELF instead of the production one.
         #[arg(long)]
         test_ca: bool,
+        /// Both vkeys as `PROGRAM_VKEY=0x..` and `TEST_CA_VKEY=0x..` lines, the
+        /// inputs Deploy.s.sol takes (it refuses PROGRAM_VKEY == TEST_CA_VKEY).
+        #[arg(long, conflicts_with_all = ["test_ca", "elf"])]
+        env: bool,
         /// Any other guest ELF (e.g. to cross-check a vkey).
         #[arg(long, conflicts_with = "test_ca")]
         elf: Option<PathBuf>,
@@ -284,7 +288,8 @@ fn main() -> Result<()> {
     sp1_sdk::utils::setup_logger();
     match Cli::parse().command {
         Command::Execute(args) => execute(&args),
-        Command::Vkey { test_ca, elf } => vkey(test_ca, elf),
+        Command::Vkey { env: true, .. } => vkey_env(),
+        Command::Vkey { test_ca, elf, .. } => vkey(test_ca, elf),
         Command::Prove(args) => prove(&args),
         Command::Fixture(args) => fixture(&args),
     }
@@ -349,6 +354,29 @@ fn execute(args: &ClaimArgs) -> Result<()> {
     Ok(())
 }
 
+/// The program vkey of `elf` (mock setup: same vkey as the CPU prover, without
+/// loading the ~7 GiB recursion keys).
+fn program_vkey(elf: Elf) -> Result<String> {
+    let client = ProverClient::builder().mock().build();
+    let pk = client.setup(elf).map_err(|e| anyhow!("setup: {e}"))?;
+    Ok(pk.verifying_key().bytes32())
+}
+
+/// `PROGRAM_VKEY=` (production) and `TEST_CA_VKEY=` lines for Deploy.s.sol.
+fn vkey_env() -> Result<()> {
+    let production = program_vkey(Program::Production.elf())?;
+    let test_ca = program_vkey(Program::TestCa.elf())?;
+    ensure!(
+        production != test_ca,
+        "production and test-ca vkeys are equal"
+    );
+    println!("# {}", Program::Production.describe());
+    println!("PROGRAM_VKEY={production}");
+    println!("# {}", Program::TestCa.describe());
+    println!("TEST_CA_VKEY={test_ca}");
+    Ok(())
+}
+
 fn vkey(test_ca: bool, elf: Option<PathBuf>) -> Result<()> {
     let (label, elf) = match elf {
         Some(path) => {
@@ -360,12 +388,9 @@ fn vkey(test_ca: bool, elf: Option<PathBuf>) -> Result<()> {
             (program.describe().to_owned(), program.elf())
         }
     };
-    // The mock prover runs the same program setup as the CPU prover without
-    // loading the recursion keys (~7 GiB).
-    let client = ProverClient::builder().mock().build();
-    let pk = client.setup(elf).map_err(|e| anyhow!("setup: {e}"))?;
+    let vkey = program_vkey(elf)?;
     println!("[vkey] {label}");
-    println!("{}", pk.verifying_key().bytes32());
+    println!("{vkey}");
     Ok(())
 }
 
@@ -563,6 +588,7 @@ mod tests {
             owner: "tlsnotary".into(),
             name: "tlsn".into(),
             threshold: 10,
+            snapshot: 1_767_225_600,
         };
         let bytes = bincode::serialize(&input).expect("serialize");
         let back: GuestInput = bincode::deserialize(&bytes).expect("deserialize");

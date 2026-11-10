@@ -10,8 +10,10 @@ use std::{
 };
 
 use orc_core::{
-    Address, B256, GuestInput, VerifyParams,
+    Address, B256, GuestInput, VerifyParams, campaign_id,
     graphql::{BranchRef, ClaimData, Commit, GraphqlResponse, History, Repository, Viewer},
+    keccak256,
+    request::{FINE_GRAINED_PAT_PREFIX, FINE_GRAINED_PAT_SECRET_LEN},
 };
 use orc_notary::{NotaryConfig, NotaryKey};
 use orc_prover::{
@@ -30,8 +32,10 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
-pub const TOKEN: &str = "ghp_TESTtoken0123456789abcdefghijklmnopq";
 pub const VIEWER_ID: &str = "U_kgDOorcTest";
+pub const VIEWER_CREATED_AT: &str = "2015-06-01T12:34:56Z";
+/// 2026-01-01T00:00:00Z: before any fixture's session time, after the account.
+pub const SNAPSHOT: u64 = 1_767_225_600;
 pub const VIEWER_DB_ID: u64 = 583_231;
 pub const REPO_DB_ID: u64 = 1_300_192;
 pub const COMMITS: u64 = 42;
@@ -40,6 +44,40 @@ pub const NOTARY_SECRET: [u8; 32] = [7u8; 32];
 /// Each MPC session needs a few hundred MB and several cores; cap how many
 /// tests run one at the same time.
 static MPC_SLOTS: Semaphore = Semaphore::const_new(2);
+
+/// A fake fine-grained PAT (`github_pat_` + 22 + `_` + 59 characters, the
+/// real shape). Built at run time so the repository holds no token-shaped
+/// literal; varied characters so a leak check cannot match by accident.
+pub fn token() -> String {
+    const ALNUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let secret: String = (0..FINE_GRAINED_PAT_SECRET_LEN)
+        .map(|i| {
+            if i == 22 {
+                '_'
+            } else {
+                char::from(ALNUM[(i * 7 + 3) % ALNUM.len()])
+            }
+        })
+        .collect();
+    format!("{FINE_GRAINED_PAT_PREFIX}{secret}")
+}
+
+/// The part of [`token`] the presentation must never contain.
+pub fn token_secret() -> String {
+    token()[FINE_GRAINED_PAT_PREFIX.len()..].to_owned()
+}
+
+/// Fixture convention for `campaignId` (see the README, "Fixtures"): what an
+/// `OrcClaim` deployed at this placeholder address on chain 84532 with
+/// `campaignSalt = keccak256("orc-poc-github-v1")` derives. The forge fixture
+/// test deploys `OrcClaim` exactly there, so harness fixtures claim on it.
+pub const FIXTURE_ORC_ADDRESS: &str = "0x000000000000000000000000000000000000C1A1";
+pub const FIXTURE_CAMPAIGN_SALT_PREIMAGE: &[u8] = b"orc-poc-github-v1";
+
+pub fn fixture_campaign_id(chain_id: u64) -> B256 {
+    let orc: Address = FIXTURE_ORC_ADDRESS.parse().expect("fixture address");
+    campaign_id(chain_id, orc, keccak256(FIXTURE_CAMPAIGN_SALT_PREIMAGE))
+}
 
 // ---- canned server replies --------------------------------------------------
 
@@ -64,6 +102,17 @@ impl Reply {
         Self {
             status_line: "HTTP/1.1 200 OK",
             body: claim_json(),
+            framing,
+        }
+    }
+
+    /// A 200 whose `viewer.createdAt` is `created_at`.
+    pub fn ok_created_at(framing: Framing, created_at: &str) -> Self {
+        let mut data = claim_data();
+        data.viewer.created_at = created_at.to_owned();
+        Self {
+            status_line: "HTTP/1.1 200 OK",
+            body: serde_json::to_string(&GraphqlResponse { data }).expect("serialize"),
             framing,
         }
     }
@@ -109,6 +158,7 @@ pub fn claim_data() -> ClaimData {
             login: "octo-test".into(),
             database_id: VIEWER_DB_ID,
             id: VIEWER_ID.into(),
+            created_at: VIEWER_CREATED_AT.into(),
         },
         repository: Repository {
             database_id: REPO_DB_ID,
@@ -186,7 +236,9 @@ async fn serve_one(
     let response = if body == preflight::PREFLIGHT_BODY.as_bytes() {
         Reply {
             status_line: "HTTP/1.1 200 OK",
-            body: format!(r#"{{"data":{{"viewer":{{"id":"{VIEWER_ID}"}}}}}}"#),
+            body: format!(
+                r#"{{"data":{{"viewer":{{"id":"{VIEWER_ID}","createdAt":"{VIEWER_CREATED_AT}"}}}}}}"#
+            ),
             framing: Framing::ContentLength,
         }
         .render()
@@ -274,12 +326,21 @@ pub fn input() -> GuestInput {
     GuestInput {
         eth_address: Address::repeat_byte(0x11),
         chain_id: 84532,
-        campaign_id: B256::repeat_byte(0x22),
+        campaign_id: fixture_campaign_id(84532),
         owner: "tlsnotary".into(),
         name: "tlsn".into(),
         threshold: 10,
+        snapshot: SNAPSHOT,
     }
 }
+
+/// Default session attempts: like production (`ProverOptions::default`), one
+/// retry after a hang or transport failure.
+pub const DEFAULT_ATTEMPTS: u32 = 2;
+/// Default deadline per MPC phase. Production uses 120 s; local phases take
+/// ~1 s, but a slow shared CI runner running two sessions at once can take
+/// far longer than the old 20 s (CI run 42841217389).
+pub const DEFAULT_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How a scenario deviates from the honest flow.
 #[derive(Default)]
@@ -291,8 +352,9 @@ pub struct Scenario {
     pub p256_notary: bool,
     /// Ask the notary for this MPC response budget.
     pub max_recv_data: Option<usize>,
+    /// Session attempts (default [`DEFAULT_ATTEMPTS`]).
     pub attempts: Option<u32>,
-    /// Prover deadline per session phase (default 20 s).
+    /// Prover deadline per session phase (default [`DEFAULT_PHASE_TIMEOUT`]).
     pub phase_timeout: Option<Duration>,
 }
 
@@ -331,10 +393,11 @@ async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverErro
         connect_addr: server.addr.to_string(),
         root_store: test_roots(),
     };
-    let token = GithubToken::new(TOKEN).expect("token");
+    let token = GithubToken::new(token()).expect("token");
     let mut opts = ProverOptions {
-        // Local phases take ~1 s; a hang (see spike m0b) is cut at 20 s and retried.
-        phase_timeout: scenario.phase_timeout.unwrap_or(Duration::from_secs(20)),
+        // A hang (see spike m0b) is cut at the phase timeout and retried once.
+        phase_timeout: scenario.phase_timeout.unwrap_or(DEFAULT_PHASE_TIMEOUT),
+        attempts: scenario.attempts.unwrap_or(DEFAULT_ATTEMPTS),
         disclosure: scenario.disclosure,
         ..ProverOptions::default()
     };
@@ -343,9 +406,6 @@ async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverErro
     }
     if let Some(max_recv) = scenario.max_recv_data {
         opts.max_recv_data = max_recv;
-    }
-    if let Some(attempts) = scenario.attempts {
-        opts.attempts = attempts;
     }
 
     let viewer = preflight::viewer_node_id(&target, &token, Duration::from_secs(30)).await?;

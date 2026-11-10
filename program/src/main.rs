@@ -1,5 +1,5 @@
 //! orc SP1 guest: verifies one GitHub commit-count claim and commits
-//! `abi.encode(PublicValues)` (256 bytes), which `OrcClaim.sol` decodes.
+//! `abi.encode(PublicValues)` (288 bytes), which `OrcClaim.sol` decodes.
 //!
 //! stdin (in order):
 //! 1. the bincode `Presentation` bytes (`read_vec`)

@@ -10,6 +10,9 @@ pub enum ClaimError {
     #[error("invalid verifier parameters: {0}")]
     Params(String),
 
+    #[error("snapshot {0} is past 9999-12-31T23:59:59Z")]
+    SnapshotOutOfRange(u64),
+
     #[error("presentation is not a valid bincode Presentation: {0}")]
     Decode(String),
 
@@ -40,11 +43,20 @@ pub enum ClaimError {
     #[error("received data must be fully revealed, but {0} bytes are hidden")]
     HiddenReceived(usize),
 
-    #[error("the only hidden sent bytes must be exactly the authorization header value")]
+    #[error(
+        "the visible start of the authorization value must be exactly `bearer github_pat_` (fine-grained personal access tokens only)"
+    )]
+    AuthPrefix,
+
+    #[error(
+        "the only hidden sent bytes must be exactly the token after `bearer github_pat_` in the authorization value"
+    )]
     SentRedaction,
 
-    #[error("hidden authorization value is {len} bytes, at most {max} are allowed")]
-    AuthValueTooLong { len: usize, max: usize },
+    #[error(
+        "the hidden token is {len} bytes, a fine-grained PAT has exactly {expected} after its prefix"
+    )]
+    AuthTokenLength { len: usize, expected: usize },
 
     #[error(transparent)]
     Http(#[from] HttpError),
@@ -65,6 +77,12 @@ pub enum ClaimError {
 
     #[error("response body is not the expected GraphQL data: {0}")]
     ResponseJson(String),
+
+    #[error("viewer.createdAt {0:?} is not a YYYY-MM-DDTHH:MM:SSZ timestamp")]
+    CreatedAt(String),
+
+    #[error("the account was created at {created_at}, not before the snapshot {snapshot}")]
+    AccountTooNew { created_at: u64, snapshot: u64 },
 
     #[error("commit count {count} is below the threshold {threshold}")]
     BelowThreshold { count: u64, threshold: u64 },

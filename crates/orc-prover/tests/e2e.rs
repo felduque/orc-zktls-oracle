@@ -13,12 +13,12 @@ use std::{
 };
 
 use harness::{
-    COMMITS, Framing, REPO_DB_ID, Reply, Run, Scenario, TOKEN, VIEWER_DB_ID, VIEWER_ID, find,
-    verify_params,
+    COMMITS, Framing, REPO_DB_ID, Reply, Run, SNAPSHOT, Scenario, VIEWER_DB_ID, VIEWER_ID, find,
+    token, token_secret, verify_params,
 };
 use orc_core::{
     Address, B256, ClaimError, GuestInput, PublicValues, VerifyParams, http, nullifier,
-    verify_claim,
+    request::AUTH_VISIBLE_PREFIX, verify_claim,
 };
 use orc_prover::{Disclosure, ProverError};
 use tokio::sync::OnceCell;
@@ -49,6 +49,7 @@ fn assert_honest_public_values(run: &Run, pv: &PublicValues) {
     assert_eq!(pv.campaignId, run.input.campaign_id);
     assert_eq!(pv.repoDatabaseId, REPO_DB_ID);
     assert_eq!(pv.threshold, run.input.threshold);
+    assert_eq!(pv.snapshot, SNAPSHOT);
     assert_eq!(pv.notaryKeyHash, run.notary_key_hash);
     assert_eq!(pv.nullifier, nullifier(VIEWER_DB_ID, run.input.campaign_id));
     let now = SystemTime::now()
@@ -83,15 +84,22 @@ async fn honest_content_length_response_verifies() {
     );
     let pv = verify(run, &run.input).expect("claim verifies");
     assert_honest_public_values(run, &pv);
-    assert_eq!(pv.to_abi_bytes().len(), 256);
+    assert_eq!(pv.to_abi_bytes().len(), 288);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn presentation_does_not_contain_the_token() {
     let run = honest().await;
-    assert!(find(&run.outcome.presentation, TOKEN.as_bytes()).is_none());
-    // The whole `bearer <token>` value is hidden, scheme included.
-    assert!(find(&run.outcome.presentation, b"bearer ").is_none());
+    let p = &run.outcome.presentation;
+    assert!(find(p, token().as_bytes()).is_none());
+    let secret = token_secret();
+    assert!(find(p, secret.as_bytes()).is_none());
+    // Not even a 12-byte window of the secret part.
+    for window in secret.as_bytes().windows(12) {
+        assert!(find(p, window).is_none());
+    }
+    // The fine-grained prefix is revealed on purpose (the verifier checks it).
+    assert!(find(p, AUTH_VISIBLE_PREFIX.as_bytes()).is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -212,16 +220,15 @@ async fn production_roots_reject_the_test_ca() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tighter_hidden_bound_rejects_the_auth_value() {
+async fn tampered_snapshot_in_input_fails_body_check() {
     let run = honest().await;
-    let params = VerifyParams {
-        max_auth_value_len: 16,
-        ..verify_params()
-    };
-    assert_err!(
-        verify_claim(&run.outcome.presentation, &run.input, &params),
-        ClaimError::AuthValueTooLong { max: 16, .. }
-    );
+    for snapshot in [SNAPSHOT - 1, SNAPSHOT + 1] {
+        let input = GuestInput {
+            snapshot,
+            ..run.input.clone()
+        };
+        assert_err!(verify(run, &input), ClaimError::BodyMismatch);
+    }
 }
 
 // ---- dishonest provers / bad responses (one MPC session each) ---------------
@@ -247,6 +254,36 @@ async fn extra_hidden_sent_range_fails() {
     };
     let run = run(Reply::ok(Framing::ContentLength), scenario).await;
     assert_err!(verify(&run, &run.input), ClaimError::SentRedaction);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whole_authorization_value_hidden_fails() {
+    // What orc revealed before it required fine-grained tokens: nothing of the
+    // value, so the verifier cannot tell what kind of token GitHub received.
+    let scenario = Scenario {
+        disclosure: Disclosure {
+            also_hide_request_headers: vec!["authorization".into()],
+            ..Disclosure::default()
+        },
+        ..Scenario::default()
+    };
+    let run = run(Reply::ok(Framing::ContentLength), scenario).await;
+    assert!(find(&run.outcome.presentation, AUTH_VISIBLE_PREFIX.as_bytes()).is_none());
+    assert_err!(verify(&run, &run.input), ClaimError::AuthPrefix);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_created_at_the_snapshot_fails() {
+    let created_at = orc_core::time::format_utc(SNAPSHOT).expect("snapshot");
+    let reply = Reply::ok_created_at(Framing::ContentLength, &created_at);
+    let run = run(reply, Scenario::default()).await;
+    assert_err!(
+        verify(&run, &run.input),
+        ClaimError::AccountTooNew {
+            created_at: SNAPSHOT,
+            snapshot: SNAPSHOT
+        }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -349,6 +386,9 @@ async fn notary_rejects_oversized_transcript_budget() {
 /// - `neg-wrong-binding`, `neg-below-threshold`: `<name>.input.json` only;
 ///   pair them with `content-length.bin`. Each is checked to fail natively
 ///   with the expected error.
+/// - `neg-auth-hidden` (the whole authorization value hidden: M1) and
+///   `neg-account-too-new` (`viewer.createdAt` == snapshot: H1):
+///   `<name>.bin` + `<name>.input.json`, each checked to fail natively.
 ///
 /// Ignored because it rewrites checked-in files (and `sessionTime` changes):
 /// `cargo test -p orc-prover --test e2e -- --ignored dump_test_ca_fixtures`
@@ -361,13 +401,16 @@ async fn dump_test_ca_fixtures() {
         let json = serde_json::to_string_pretty(input).expect("input json") + "\n";
         std::fs::write(dir.join(format!("{name}.input.json")), json).expect("write input");
     };
-    let write_run = |name: &str, run: &Run| {
-        let pv = verify(run, &run.input).expect("positive fixture verifies natively");
-        assert_honest_public_values(run, &pv);
-        assert!(find(&run.outcome.presentation, TOKEN.as_bytes()).is_none());
+    let write_presentation = |name: &str, run: &Run| {
+        assert!(find(&run.outcome.presentation, token_secret().as_bytes()).is_none());
         std::fs::write(dir.join(format!("{name}.bin")), &run.outcome.presentation)
             .expect("write presentation");
         write_input(name, &run.input);
+    };
+    let write_run = |name: &str, run: &Run| {
+        let pv = verify(run, &run.input).expect("positive fixture verifies natively");
+        assert_honest_public_values(run, &pv);
+        write_presentation(name, run);
     };
 
     let content_length = honest().await;
@@ -404,4 +447,33 @@ async fn dump_test_ca_fixtures() {
         ClaimError::BelowThreshold { count: COMMITS, .. }
     );
     write_input("neg-below-threshold", &below_threshold);
+
+    let auth_hidden = run(
+        Reply::ok(Framing::ContentLength),
+        Scenario {
+            disclosure: Disclosure {
+                also_hide_request_headers: vec!["authorization".into()],
+                ..Disclosure::default()
+            },
+            ..Scenario::default()
+        },
+    )
+    .await;
+    assert_err!(
+        verify(&auth_hidden, &auth_hidden.input),
+        ClaimError::AuthPrefix
+    );
+    write_presentation("neg-auth-hidden", &auth_hidden);
+
+    let created_at = orc_core::time::format_utc(SNAPSHOT).expect("snapshot");
+    let too_new = run(
+        Reply::ok_created_at(Framing::ContentLength, &created_at),
+        Scenario::default(),
+    )
+    .await;
+    assert_err!(
+        verify(&too_new, &too_new.input),
+        ClaimError::AccountTooNew { .. }
+    );
+    write_presentation("neg-account-too-new", &too_new);
 }

@@ -1,4 +1,5 @@
-//! Solidity-facing values: `PublicValues`, the request binding and the nullifier.
+//! Solidity-facing values: `PublicValues`, the request binding, the nullifier
+//! and the campaign id derivation.
 //!
 //! The `abi.encode` preimages are built by hand (all operands are static
 //! 32-byte words) so the byte layout is explicit; unit tests cross-check them
@@ -12,8 +13,12 @@ use tiny_keccak::{Hasher, Keccak};
 
 sol! {
     /// Public outputs of a verified claim. The guest commits
-    /// `abi.encode(PublicValues)` (8 static words, 256 bytes) and
+    /// `abi.encode(PublicValues)` (9 static words, 288 bytes) and
     /// `OrcClaim.sol` decodes it with `abi.decode(publicValues, (PublicValues))`.
+    ///
+    /// Field order is grouped by role: the binding (who, which chain, which
+    /// campaign), the claim the contract pins (repo, threshold, snapshot), the
+    /// TLS session (notary, time), and the nullifier last.
     #[derive(Debug, PartialEq, Eq)]
     struct PublicValues {
         address ethAddress;
@@ -21,6 +26,7 @@ sol! {
         bytes32 campaignId;
         uint64 repoDatabaseId;
         uint64 threshold;
+        uint64 snapshot;
         bytes32 notaryKeyHash;
         uint64 sessionTime;
         bytes32 nullifier;
@@ -34,6 +40,10 @@ impl fmt::Display for PublicValues {
         writeln!(f, "campaignId     {}", self.campaignId)?;
         writeln!(f, "repoDatabaseId {}", self.repoDatabaseId)?;
         writeln!(f, "threshold      {}", self.threshold)?;
+        match crate::time::format_utc(self.snapshot) {
+            Some(utc) => writeln!(f, "snapshot       {} ({utc})", self.snapshot)?,
+            None => writeln!(f, "snapshot       {}", self.snapshot)?,
+        }
         writeln!(f, "notaryKeyHash  {}", self.notaryKeyHash)?;
         writeln!(f, "sessionTime    {}", self.sessionTime)?;
         write!(f, "nullifier      {}", self.nullifier)
@@ -81,6 +91,18 @@ pub fn nullifier(database_id: u64, campaign_id: B256) -> B256 {
     let mut preimage = [0u8; 64];
     preimage[..32].copy_from_slice(&u64_word(database_id));
     preimage[32..].copy_from_slice(campaign_id.as_slice());
+    keccak256(&preimage)
+}
+
+/// `keccak256(abi.encode(uint256(chainId), contract, salt))`: the campaign id
+/// `OrcClaim`'s constructor derives from `block.chainid`, its own address and
+/// `campaignSalt`. A redeploy (or the same salt on another chain) gets a fresh
+/// campaign id, so proofs and nullifiers never carry over between deployments.
+pub fn campaign_id(chain_id: u64, contract: Address, salt: B256) -> B256 {
+    let mut preimage = [0u8; 96];
+    preimage[..32].copy_from_slice(&u64_word(chain_id));
+    preimage[32..64].copy_from_slice(&address_word(contract));
+    preimage[64..].copy_from_slice(salt.as_slice());
     keccak256(&preimage)
 }
 
@@ -137,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn campaign_id_matches_alloy_abi_encode() {
+        let expected = keccak256(&(U256::from(84532u64), ADDR, CAMPAIGN).abi_encode_params());
+        assert_eq!(campaign_id(84532, ADDR, CAMPAIGN), expected);
+        // Bound to the chain and the contract address, not just the salt.
+        assert_ne!(
+            campaign_id(84532, ADDR, CAMPAIGN),
+            campaign_id(1, ADDR, CAMPAIGN)
+        );
+        assert_ne!(
+            campaign_id(84532, ADDR, CAMPAIGN),
+            campaign_id(84532, Address::ZERO, CAMPAIGN)
+        );
+    }
+
+    #[test]
     fn keccak_known_vector() {
         // keccak256("") from the Ethereum yellow paper.
         assert_eq!(
@@ -146,19 +183,22 @@ mod tests {
     }
 
     #[test]
-    fn public_values_encode_to_eight_static_words() {
+    fn public_values_encode_to_nine_static_words() {
         let pv = PublicValues {
             ethAddress: ADDR,
             chainId: 84532,
             campaignId: CAMPAIGN,
             repoDatabaseId: 7,
             threshold: 3,
+            snapshot: 1_690_000_000,
             notaryKeyHash: keccak256(b"k"),
             sessionTime: 1_700_000_000,
             nullifier: nullifier(1, CAMPAIGN),
         };
         let encoded = pv.abi_encode();
-        assert_eq!(encoded.len(), 8 * 32);
+        assert_eq!(encoded.len(), 9 * 32);
+        // Word 5 is the snapshot (OrcClaim.sol and the forge ABI test rely on it).
+        assert_eq!(encoded[5 * 32..6 * 32], u64_word(1_690_000_000));
         let decoded = PublicValues::abi_decode(&encoded).expect("decode");
         assert_eq!(decoded, pv);
     }

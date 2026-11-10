@@ -2,13 +2,17 @@
 //!
 //! The token is read from `GITHUB_TOKEN` only (never a flag) and never
 //! printed or written; `--out-dir` receives just `presentation.bin` and
-//! `guest-input.json`.
+//! `guest-input.json`. Only fine-grained personal access tokens are accepted.
+//!
+//! `--campaign-id` and `--snapshot` come from the deployed `OrcClaim`:
+//!   cast call <OrcClaim> "campaignId()(bytes32)"
+//!   cast call <OrcClaim> "snapshot()(uint64)"
 
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use orc_core::{Address, B256, GuestInput, VerifyParams, verify_claim};
+use orc_core::{Address, B256, GuestInput, VerifyParams, time, verify_claim};
 use orc_prover::{GithubToken, ProverOptions, Target, preflight, prove};
 
 #[derive(Debug, Parser)]
@@ -45,9 +49,14 @@ struct ProveArgs {
     /// Target chain id (84532 = Base Sepolia).
     #[arg(long)]
     chain_id: u64,
-    /// Campaign id (bytes32 hex).
+    /// Campaign id (bytes32 hex): `cast call <OrcClaim> "campaignId()(bytes32)"`.
+    /// OrcClaim derives it from the chain id, its own address and a salt.
     #[arg(long)]
     campaign_id: B256,
+    /// Snapshot, unix seconds: `cast call <OrcClaim> "snapshot()(uint64)"`.
+    /// Only commits authored up to it count, and the account must be older.
+    #[arg(long)]
+    snapshot: u64,
     /// Notary `host:port`.
     #[arg(long, default_value = "127.0.0.1:7047")]
     notary: String,
@@ -81,7 +90,10 @@ async fn run_prove(args: ProveArgs) -> Result<()> {
         owner: args.owner,
         name: args.name,
         threshold: args.threshold,
+        snapshot: args.snapshot,
     };
+    let snapshot_utc = time::format_utc(args.snapshot)
+        .with_context(|| format!("--snapshot {} is past year 9999", args.snapshot))?;
     let opts = ProverOptions {
         phase_timeout: Duration::from_secs(args.phase_timeout_secs),
         ..ProverOptions::default()
@@ -90,9 +102,24 @@ async fn run_prove(args: ProveArgs) -> Result<()> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("create {}", args.out_dir.display()))?;
 
-    println!("[1/3] preflight: viewer id (plain HTTPS, outside MPC)");
-    let viewer_id = preflight::viewer_node_id(&target, &token, opts.phase_timeout).await?;
-    println!("      viewer.id = {viewer_id}");
+    println!("[1/3] preflight: viewer id + createdAt (plain HTTPS, outside MPC)");
+    let viewer = preflight::viewer(&target, &token, opts.phase_timeout).await?;
+    println!(
+        "      viewer.id = {}, createdAt = {}, snapshot = {snapshot_utc}",
+        viewer.id, viewer.created_at
+    );
+    // The guest enforces this on the notarized response; failing here saves
+    // an MPC session (and a GitHub API point) that could never verify.
+    match time::parse_utc(&viewer.created_at) {
+        Some(created) if created < args.snapshot => {}
+        Some(_) => bail!(
+            "this GitHub account was created at {}, not before the campaign snapshot \
+             {snapshot_utc}: the claim cannot verify",
+            viewer.created_at
+        ),
+        None => bail!("unexpected viewer.createdAt format {:?}", viewer.created_at),
+    }
+    let viewer_id = viewer.id;
 
     println!(
         "[2/3] MPC-TLS with notary {} -> {}",

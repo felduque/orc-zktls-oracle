@@ -22,4 +22,7 @@ pub struct GuestInput {
     pub name: String,
     /// Minimum commit count to prove.
     pub threshold: u64,
+    /// Snapshot, unix seconds (`OrcClaim.snapshot()`): only commits authored
+    /// up to it count, and the account must have been created before it.
+    pub snapshot: u64,
 }

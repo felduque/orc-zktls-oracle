@@ -4,15 +4,18 @@ pragma solidity ^0.8.20;
 import {ISP1Verifier} from "@sp1-contracts/ISP1Verifier.sol";
 
 /// @notice Public outputs committed by the orc SP1 guest.
-/// @dev MUST mirror `PublicValues` in crates/orc-core/src/abi.rs field for field. All eight
-///      fields are static, so `abi.encode(PublicValues)` is a flat 256-byte tuple (no offset
-///      word), byte-identical to alloy's `abi_encode()` of the same struct.
+/// @dev MUST mirror `PublicValues` in crates/orc-core/src/abi.rs field for field. All nine
+///      fields are static, so `abi.encode(PublicValues)` is a flat 288-byte tuple (no offset
+///      word), byte-identical to alloy's `abi_encode()` of the same struct. Grouped by role:
+///      binding (ethAddress, chainId, campaignId), the pinned claim (repoDatabaseId, threshold,
+///      snapshot), the TLS session (notaryKeyHash, sessionTime), then the nullifier.
 struct PublicValues {
     address ethAddress;
     uint64 chainId;
     bytes32 campaignId;
     uint64 repoDatabaseId;
     uint64 threshold;
+    uint64 snapshot;
     bytes32 notaryKeyHash;
     uint64 sessionTime;
     bytes32 nullifier;
@@ -27,17 +30,27 @@ struct PublicValues {
 ///      The nullifier keccak256(abi.encode(uint256(githubDatabaseId), campaignId)) is linkable:
 ///      GitHub databaseIds are sequential, so anyone can brute-force it back to the account.
 ///
+///      Snapshot: GitHub attributes commits to an account by email, while the nullifier is per
+///      account, so an email moved to a fresh account could claim the same commits again. The
+///      guest counts only commits authored up to `snapshot` and requires the account to have
+///      been created before it, so only accounts that already existed at the snapshot can
+///      claim (moving an email among those remains possible).
+///
+///      Campaign id: derived in the constructor from the chain id, this contract's address and
+///      a salt, so a redeploy (or the same salt on another chain) never accepts proofs or
+///      nullifiers made for another deployment.
+///
 ///      Ordering: the cheap checks run on the decoded, not yet proven, values BEFORE the
 ///      ~270k gas proof verification. This is sound because the transaction is atomic and every
 ///      check is conjunctive: `verifyProof` binds exactly the same `publicValues` bytes that were
 ///      decoded, and it runs before any state change, so a forged value that passes a cheap
 ///      check is still rejected by the proof. Decoding untrusted bytes is safe: the length is
-///      pinned to 256 first, and the ABI v2 decoder reverts on dirty address/uint64 words.
+///      pinned to 288 first, and the ABI v2 decoder reverts on dirty address/uint64 words.
 ///      The upside is that wrong-sender (mempool copy), replay and stale claims revert for a
 ///      few thousand gas instead of paying for a pairing check first.
 contract OrcClaim {
-    /// @notice `abi.encode(PublicValues)`: eight static 32-byte words.
-    uint256 public constant PUBLIC_VALUES_LENGTH = 256;
+    /// @notice `abi.encode(PublicValues)`: nine static 32-byte words.
+    uint256 public constant PUBLIC_VALUES_LENGTH = 288;
 
     /// @notice Tolerated clock skew for a `sessionTime` ahead of `block.timestamp`, in seconds.
     uint256 public constant MAX_FUTURE_SKEW = 300;
@@ -48,12 +61,18 @@ contract OrcClaim {
     bytes32 public immutable programVKey;
     /// @notice keccak256 of the accepted notary's compressed secp256k1 public key.
     bytes32 public immutable notaryKeyHash;
+    /// @notice Deployer-chosen salt that `campaignId` is derived from.
+    bytes32 public immutable campaignSalt;
     /// @notice Campaign this contract pays out for; part of the address binding and nullifier.
+    ///         `keccak256(abi.encode(block.chainid, address(this), campaignSalt))`.
     bytes32 public immutable campaignId;
     /// @notice GitHub `databaseId` of the repository the commits must be in.
     uint64 public immutable repoDatabaseId;
     /// @notice Minimum commit count a proof must attest.
     uint64 public immutable threshold;
+    /// @notice Unix seconds. Only commits authored up to it count, and the GitHub account must
+    ///         have been created before it.
+    uint64 public immutable snapshot;
     /// @notice Maximum age of the notarized TLS session, in seconds.
     uint64 public immutable maxAge;
 
@@ -68,9 +87,9 @@ contract OrcClaim {
         uint64 sessionTime
     );
 
-    /// @notice A constructor argument is zero.
+    /// @notice A constructor argument is zero (or the snapshot is in the future).
     error InvalidConfig(string field);
-    /// @notice `publicValues` is not exactly 256 bytes.
+    /// @notice `publicValues` is not exactly 288 bytes.
     error InvalidPublicValuesLength(uint256 length);
     /// @notice The proof is bound to `expected`, but `actual` sent the claim.
     error WrongSender(address expected, address actual);
@@ -84,6 +103,8 @@ contract OrcClaim {
     error WrongNotary(bytes32 expected, bytes32 got);
     /// @notice The proof attests fewer commits than required.
     error ThresholdTooLow(uint64 required, uint64 proven);
+    /// @notice The proof was made for another snapshot.
+    error WrongSnapshot(uint64 expected, uint64 got);
     /// @notice `sessionTime` is more than MAX_FUTURE_SKEW seconds ahead of the block.
     error SessionInFuture(uint64 sessionTime, uint256 blockTimestamp);
     /// @notice The TLS session is older than `maxAge`.
@@ -95,28 +116,34 @@ contract OrcClaim {
         ISP1Verifier _verifier,
         bytes32 _programVKey,
         bytes32 _notaryKeyHash,
-        bytes32 _campaignId,
+        bytes32 _campaignSalt,
         uint64 _repoDatabaseId,
         uint64 _threshold,
+        uint64 _snapshot,
         uint64 _maxAge
     ) {
         if (address(_verifier) == address(0)) revert InvalidConfig("verifier");
         if (_programVKey == bytes32(0)) revert InvalidConfig("programVKey");
         if (_notaryKeyHash == bytes32(0)) revert InvalidConfig("notaryKeyHash");
-        if (_campaignId == bytes32(0)) revert InvalidConfig("campaignId");
+        if (_campaignSalt == bytes32(0)) revert InvalidConfig("campaignSalt");
+        // A snapshot in the future would let accounts created after the deployment claim.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (_snapshot == 0 || _snapshot > block.timestamp) revert InvalidConfig("snapshot");
         if (_maxAge == 0) revert InvalidConfig("maxAge");
 
         verifier = _verifier;
         programVKey = _programVKey;
         notaryKeyHash = _notaryKeyHash;
-        campaignId = _campaignId;
+        campaignSalt = _campaignSalt;
+        campaignId = keccak256(abi.encode(block.chainid, address(this), _campaignSalt));
         repoDatabaseId = _repoDatabaseId;
         threshold = _threshold;
+        snapshot = _snapshot;
         maxAge = _maxAge;
     }
 
     /// @notice Claims for `msg.sender` with an SP1 proof of the orc guest.
-    /// @param publicValues `abi.encode(PublicValues)` as committed by the guest (256 bytes).
+    /// @param publicValues `abi.encode(PublicValues)` as committed by the guest (288 bytes).
     /// @param proofBytes SP1 proof bytes (Groth16 on public chains; empty for the mock verifier).
     function claim(bytes calldata publicValues, bytes calldata proofBytes) external {
         // Checks, cheap ones first (see the ordering note on the contract).
@@ -133,6 +160,7 @@ contract OrcClaim {
         }
         if (pv.notaryKeyHash != notaryKeyHash) revert WrongNotary(notaryKeyHash, pv.notaryKeyHash);
         if (pv.threshold < threshold) revert ThresholdTooLow(threshold, pv.threshold);
+        if (pv.snapshot != snapshot) revert WrongSnapshot(snapshot, pv.snapshot);
         // Freshness window. block.timestamp is intended here: a sequencer can shift it by
         // seconds, which is negligible next to a 300 s skew and a maxAge measured in hours.
         // forge-lint: disable-next-line(block-timestamp)

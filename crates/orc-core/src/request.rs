@@ -47,3 +47,39 @@ pub mod header {
 
 /// Prefix of the `Authorization` value (`bearer <token>`).
 pub const AUTH_SCHEME_PREFIX: &str = "bearer ";
+
+/// Prefix of a GitHub fine-grained personal access token. orc accepts no
+/// other token type (classic `ghp_`, OAuth `gho_`, user-to-server `ghu_`,
+/// installation `ghs_`, ...): see [`AUTH_VISIBLE_PREFIX`].
+pub const FINE_GRAINED_PAT_PREFIX: &str = "github_pat_";
+
+/// Length of the secret part of a fine-grained PAT, after
+/// [`FINE_GRAINED_PAT_PREFIX`]: 22 characters, `_`, 59 characters (93 in all).
+pub const FINE_GRAINED_PAT_SECRET_LEN: usize = 82;
+
+/// The revealed start of the `Authorization` value:
+/// [`AUTH_SCHEME_PREFIX`] + [`FINE_GRAINED_PAT_PREFIX`].
+///
+/// The prover reveals it and hides exactly the [`FINE_GRAINED_PAT_SECRET_LEN`]
+/// bytes after it. Because the revealed bytes are authenticated transcript
+/// data, the verifier knows GitHub received a fine-grained PAT, so a holder of
+/// some other credential for the account (an OAuth or GitHub App token) cannot
+/// claim as that user. The fixed hidden length also caps what a dishonest
+/// prover could hide there (see `crate::verify`).
+pub const AUTH_VISIBLE_PREFIX: &str = "bearer github_pat_";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_prefix_is_scheme_plus_token_prefix() {
+        assert_eq!(
+            AUTH_VISIBLE_PREFIX,
+            format!("{AUTH_SCHEME_PREFIX}{FINE_GRAINED_PAT_PREFIX}")
+        );
+        // Hidden bytes are replaced by `X` before parsing (crate::verify), so a
+        // hidden byte can never pass for a revealed prefix byte.
+        assert!(!AUTH_VISIBLE_PREFIX.contains('X'));
+    }
+}

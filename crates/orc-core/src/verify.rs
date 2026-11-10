@@ -1,21 +1,25 @@
 //! [`verify_claim`]: every check the SP1 guest performs, in order.
 //!
+//! 0. The snapshot is representable as `YYYY-MM-DDTHH:MM:SSZ`.
 //! 1. Decode the bincode `Presentation` (size-limited, no trailing bytes).
 //! 2. Notary key is k256, 33-byte compressed; `notaryKeyHash = keccak256(key)`.
 //! 3. Full `Presentation::verify` (notary signature, Merkle openings, server
 //!    certificate chain + TLS signature, transcript hash openings); signature
 //!    alg is secp256k1, commitment root is SHA-256, server name matches.
-//! 4. Redaction: all received bytes are revealed; the only hidden sent bytes
-//!    are exactly the (single) `authorization` header value, and it is short
-//!    enough that it cannot carry a smuggled alternative query (see
-//!    [`DEFAULT_MAX_AUTH_VALUE_LEN`]).
+//! 4. Redaction: all received bytes are revealed. The (single) `authorization`
+//!    value starts with the revealed `bearer github_pat_`, and the only hidden
+//!    sent bytes are exactly the 82 token bytes after it: GitHub received a
+//!    fine-grained PAT, and the hidden range is too short to carry a smuggled
+//!    alternative query (see [`check_transcript`]).
 //! 5. Exactly one request and one response.
 //! 6. Request: `POST /graphql HTTP/1.1`, exactly the orc header set with the
 //!    expected values, `x-orc-binding` derived from the input.
 //! 7. Response: status 200, body parses strictly as the expected GraphQL data.
-//! 8. Request body is byte-identical to `graphql_body(owner, name, viewer.id)`,
-//!    so the commit count is the authenticated viewer's.
-//! 9. `totalCount >= threshold`.
+//! 8. Request body is byte-identical to
+//!    `graphql_body(owner, name, viewer.id, snapshot)`, so the commit count is
+//!    the authenticated viewer's, counted up to the snapshot.
+//! 9. `viewer.createdAt` (strict `YYYY-MM-DDTHH:MM:SSZ`) is before the snapshot.
+//! 10. `totalCount >= threshold`.
 //!
 //! [`verify_claim_tracked`] reports these steps as phases to a [`Tracker`]
 //! (the SP1 guest turns them into cycle-tracker markers); [`verify_claim`]
@@ -40,7 +44,8 @@ use crate::{
     graphql::{self, ClaimData, graphql_body},
     http::{self, HttpRequest, HttpResponse},
     input::GuestInput,
-    request::{self, header},
+    request::{self, AUTH_VISIBLE_PREFIX, FINE_GRAINED_PAT_SECRET_LEN, header},
+    time,
 };
 
 /// Production server name.
@@ -50,27 +55,14 @@ pub const GITHUB_API_HOST: &str = "api.github.com";
 /// certificate chain is ~30 KiB).
 pub const MAX_PRESENTATION_BYTES: u64 = 256 * 1024;
 
-/// Upper bound on the hidden `authorization` value (`bearer <token>`).
-///
-/// The verifier cannot see hidden bytes, so a malicious prover could hide
-/// header or body bytes inside that range (e.g. `\r\n\r\n` and a different
-/// GraphQL query). Bounding the range keeps that infeasible: after `bearer `
-/// and a real token (40 chars classic, 93 fine-grained) at most ~80 bytes
-/// remain, far less than any query whose response matches the strict
-/// [`graphql::GraphqlResponse`] shape (~160 bytes of field names alone).
-/// 128 accepts both token formats.
-pub const DEFAULT_MAX_AUTH_VALUE_LEN: usize = 128;
-
-/// What the verifier trusts: the server name, the root certificates (inside
-/// `provider`) and the hidden-range bound.
+/// What the verifier trusts: the server name and the root certificates
+/// (inside `provider`).
 #[derive(Debug)]
 pub struct VerifyParams {
     /// Required authenticated server name (and `Host` header value).
     pub expected_server: String,
     /// Crypto provider; its certificate verifier holds the trusted roots.
     pub provider: CryptoProvider,
-    /// See [`DEFAULT_MAX_AUTH_VALUE_LEN`].
-    pub max_auth_value_len: usize,
 }
 
 impl VerifyParams {
@@ -79,7 +71,6 @@ impl VerifyParams {
         Self {
             expected_server: GITHUB_API_HOST.to_owned(),
             provider: CryptoProvider::default(),
-            max_auth_value_len: DEFAULT_MAX_AUTH_VALUE_LEN,
         }
     }
 
@@ -95,7 +86,6 @@ impl VerifyParams {
                 cert,
                 ..CryptoProvider::default()
             },
-            max_auth_value_len: DEFAULT_MAX_AUTH_VALUE_LEN,
         })
     }
 }
@@ -109,7 +99,8 @@ pub mod phase {
     pub const VERIFY: &str = "verify";
     /// Steps 4-6: redaction rule, HTTP request/response parsing, request shape.
     pub const HTTP: &str = "http";
-    /// Steps 7-9: strict GraphQL JSON parse, body/threshold checks, nullifier.
+    /// Steps 7-10: strict GraphQL JSON parse, body/account-age/threshold
+    /// checks, nullifier.
     pub const JSON: &str = "json";
 }
 
@@ -149,10 +140,14 @@ pub fn verify_claim_tracked(
     params: &VerifyParams,
     tracker: &mut impl Tracker,
 ) -> Result<PublicValues, ClaimError> {
+    // The snapshot as the request's `until` variable (cheap, so first).
+    let until =
+        time::format_utc(input.snapshot).ok_or(ClaimError::SnapshotOutOfRange(input.snapshot))?;
+
     let session = verify_session(presentation, params, tracker)?;
 
     tracker.start(phase::HTTP);
-    let exchange = check_transcript(session.transcript, params)?;
+    let exchange = check_transcript(session.transcript)?;
     check_request(&exchange.request, input, params)?;
     tracker.end(phase::HTTP);
 
@@ -160,11 +155,13 @@ pub fn verify_claim_tracked(
     let data = check_response(&exchange.response)?;
 
     // The query variable `$a` must be the authenticated viewer, otherwise the
-    // count could be someone else's commits.
-    let expected_body = graphql_body(&input.owner, &input.name, &data.viewer.id);
+    // count could be someone else's commits; `$u` must be the snapshot.
+    let expected_body = graphql_body(&input.owner, &input.name, &data.viewer.id, &until);
     if exchange.request.body != expected_body.as_bytes() {
         return Err(ClaimError::BodyMismatch);
     }
+
+    check_account_age(&data.viewer.created_at, input.snapshot)?;
 
     let count = data
         .repository
@@ -185,6 +182,7 @@ pub fn verify_claim_tracked(
         campaignId: input.campaign_id,
         repoDatabaseId: data.repository.database_id,
         threshold: input.threshold,
+        snapshot: input.snapshot,
         notaryKeyHash: session.notary_key_hash,
         sessionTime: session.session_time,
         nullifier: nullifier(data.viewer.database_id, input.campaign_id),
@@ -201,6 +199,7 @@ struct VerifiedSession {
 }
 
 /// The parsed HTTP exchange (steps 4-5).
+#[derive(Debug)]
 struct Exchange {
     request: HttpRequest,
     response: HttpResponse,
@@ -283,10 +282,21 @@ fn verify_session(
     Ok(session)
 }
 
-fn check_transcript(
-    mut transcript: PartialTranscript,
-    params: &VerifyParams,
-) -> Result<Exchange, ClaimError> {
+/// Steps 4-5: the redaction rule (M1), then one request and one response.
+///
+/// The `authorization` value must be the revealed `bearer github_pat_`
+/// followed by exactly [`FINE_GRAINED_PAT_SECRET_LEN`] hidden bytes, and
+/// those must be the only hidden sent bytes. Why this shape:
+///
+/// - The revealed prefix is authenticated transcript data, so GitHub received
+///   a fine-grained PAT. Someone holding a different credential for the same
+///   account (an OAuth app or GitHub App token, a classic PAT) cannot claim.
+/// - The verifier cannot see hidden bytes, so a dishonest prover could hide
+///   header or body bytes in that range (e.g. `\r\n\r\n` and a different
+///   GraphQL query). 82 bytes is far less than any query whose response
+///   matches the strict [`graphql::GraphqlResponse`] shape (~170 bytes of
+///   field names alone), so that is infeasible.
+fn check_transcript(mut transcript: PartialTranscript) -> Result<Exchange, ClaimError> {
     let hidden_recv = transcript.received_unauthed();
     if !hidden_recv.is_empty() {
         return Err(ClaimError::HiddenReceived(hidden_recv.len()));
@@ -294,11 +304,13 @@ fn check_transcript(
     let hidden_sent = transcript.sent_unauthed();
 
     // Hidden bytes become 'X' so the request still parses; the parse result
-    // locates the authorization value, which must be exactly what is hidden.
+    // locates the authorization value. 'X' never occurs in the visible prefix,
+    // so a hidden byte can never pass for a revealed one.
     transcript.set_unauthed(b'X');
-    let request = http::parse_request(transcript.sent_unsafe())?;
+    let sent = transcript.sent_unsafe();
+    let request = http::parse_request(sent)?;
 
-    let auth_value = {
+    let value = {
         let mut auth = request.headers_named(header::AUTHORIZATION);
         match (auth.next(), auth.next()) {
             (Some(h), None) => h.value_range.clone(),
@@ -309,13 +321,26 @@ fn check_transcript(
             }
         }
     };
-    if auth_value.is_empty() || hidden_sent != auth_value {
+    let value = match value.iter().collect::<Vec<_>>().as_slice() {
+        [range] => range.clone(),
+        _ => return Err(ClaimError::SentRedaction),
+    };
+
+    // `bearer github_pat_`, revealed.
+    let token_start = value.start + AUTH_VISIBLE_PREFIX.len();
+    if token_start > value.end || sent[value.start..token_start] != *AUTH_VISIBLE_PREFIX.as_bytes()
+    {
+        return Err(ClaimError::AuthPrefix);
+    }
+    // Exactly the rest of the value is hidden, and nothing else.
+    let token = token_start..value.end;
+    if hidden_sent != token {
         return Err(ClaimError::SentRedaction);
     }
-    if auth_value.len() > params.max_auth_value_len {
-        return Err(ClaimError::AuthValueTooLong {
-            len: auth_value.len(),
-            max: params.max_auth_value_len,
+    if token.len() != FINE_GRAINED_PAT_SECRET_LEN {
+        return Err(ClaimError::AuthTokenLength {
+            len: token.len(),
+            expected: FINE_GRAINED_PAT_SECRET_LEN,
         });
     }
 
@@ -363,7 +388,7 @@ fn check_request(
                 }
                 continue;
             }
-            // authorization: hidden; its range was checked in check_transcript.
+            // authorization: its shape was checked in check_transcript.
             _ => continue,
         };
         if h.value != expected {
@@ -379,6 +404,21 @@ fn check_request(
     Ok(())
 }
 
+/// Step 9: the account existed before the snapshot (H1). Commits are
+/// attributed to an account by email, so an email moved to a fresh account
+/// would otherwise let the same commits be claimed again under a new nullifier.
+fn check_account_age(created_at: &str, snapshot: u64) -> Result<(), ClaimError> {
+    let created =
+        time::parse_utc(created_at).ok_or_else(|| ClaimError::CreatedAt(created_at.to_owned()))?;
+    if created >= snapshot {
+        return Err(ClaimError::AccountTooNew {
+            created_at: created,
+            snapshot,
+        });
+    }
+    Ok(())
+}
+
 fn check_response(response: &HttpResponse) -> Result<ClaimData, ClaimError> {
     if response.status != 200 {
         return Err(ClaimError::Status(response.status));
@@ -390,10 +430,14 @@ fn check_response(response: &HttpResponse) -> Result<ClaimData, ClaimError> {
 
 #[cfg(test)]
 mod tests {
+    use core::ops::Range;
+
     use alloy_primitives::{Address, B256, hex};
+    use rangeset::set::RangeSet;
+    use tlsn_core::transcript::Transcript;
 
     use super::*;
-    use crate::{abi::keccak256, http::Framing};
+    use crate::{abi::keccak256, http::Framing, request::FINE_GRAINED_PAT_PREFIX};
 
     fn fixture(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -409,13 +453,15 @@ mod tests {
             owner: "tlsnotary".into(),
             name: "tlsn".into(),
             threshold: 0,
+            snapshot: 1_767_225_600,
         }
     }
 
     /// Real api.github.com presentation from spike M0b: `POST /graphql` with a
-    /// dummy redacted token, answered by a close-delimited 401. Exercises the
-    /// production root store, the full verify on real certificates, the
-    /// redaction rule and the close-delimited fallback parser.
+    /// dummy token, answered by a close-delimited 401. Exercises the
+    /// production root store, the full verify on real certificates and the
+    /// close-delimited fallback parser. The spike hid the WHOLE `bearer <dummy>`
+    /// value (the pre-M1 disclosure), so the redaction rule rejects it.
     #[test]
     fn real_github_401_close_delimited_fixture() {
         let bytes = std::fs::read(fixture("m0b-github-graphql-401.bin")).expect("fixture");
@@ -427,17 +473,21 @@ mod tests {
             .expect("hex");
         assert_eq!(session.notary_key_hash, keccak256(&key));
 
-        let exchange = check_transcript(session.transcript, &params).expect("transcript");
-        assert_eq!(exchange.request.request_line, request::REQUEST_LINE);
-        assert_eq!(exchange.response.status, 401);
-        assert_eq!(exchange.response.framing, Framing::CloseDelimited);
+        assert!(session.transcript.received_unauthed().is_empty());
+        let response =
+            http::parse_response(session.transcript.received_unsafe()).expect("401 response");
+        assert_eq!(response.status, 401);
+        assert_eq!(response.framing, Framing::CloseDelimited);
         let body: serde_json::Value =
-            serde_json::from_slice(&exchange.response.body).expect("401 body is JSON");
+            serde_json::from_slice(&response.body).expect("401 body is JSON");
         assert_eq!(body["message"], "Bad credentials");
 
-        // The spike sent `x-orc-binding: 0xdeadbeef`, so the claim fails there.
+        assert!(matches!(
+            check_transcript(session.transcript),
+            Err(ClaimError::AuthPrefix)
+        ));
         let err = verify_claim(&bytes, &any_input(), &params).expect_err("must fail");
-        assert!(matches!(err, ClaimError::BindingMismatch), "{err}");
+        assert!(matches!(err, ClaimError::AuthPrefix), "{err}");
     }
 
     /// Phases are reported in order; a failing phase is started but not ended.
@@ -457,7 +507,7 @@ mod tests {
         let mut record = Record(Vec::new());
         let err = verify_claim_tracked(&bytes, &any_input(), &VerifyParams::github(), &mut record)
             .expect_err("must fail");
-        assert!(matches!(err, ClaimError::BindingMismatch), "{err}");
+        assert!(matches!(err, ClaimError::AuthPrefix), "{err}");
         assert_eq!(
             record.0,
             [
@@ -502,6 +552,17 @@ mod tests {
         assert!(matches!(err, ClaimError::Decode(_)), "{err}");
     }
 
+    #[test]
+    fn snapshot_past_year_9999_is_rejected_before_decoding() {
+        let input = GuestInput {
+            snapshot: time::MAX_UNIX_SECONDS + 1,
+            ..any_input()
+        };
+        let err =
+            verify_claim(b"not a presentation", &input, &VerifyParams::github()).expect_err("fail");
+        assert!(matches!(err, ClaimError::SnapshotOutOfRange(_)), "{err}");
+    }
+
     /// Real authenticated 200 from `orc prove`, if one has been recorded
     /// (`fixtures/github-graphql-200.bin` + `.input.json`). Needs a PAT to
     /// produce, so it is skipped when absent.
@@ -519,14 +580,265 @@ mod tests {
         let pv = verify_claim(&bytes, &input, &VerifyParams::github()).expect("claim verifies");
         assert_eq!(pv.ethAddress, input.eth_address);
         assert_eq!(pv.threshold, input.threshold);
+        assert_eq!(pv.snapshot, input.snapshot);
+        assert!(pv.sessionTime > pv.snapshot);
+
+        // The snapshot is bound by the request body: any other one fails.
+        let shifted = GuestInput {
+            snapshot: input.snapshot - 1,
+            ..input.clone()
+        };
+        let err = verify_claim(&bytes, &shifted, &VerifyParams::github()).expect_err("fail");
+        assert!(matches!(err, ClaimError::BodyMismatch), "{err}");
     }
 
     #[test]
     fn guest_input_json_is_strict() {
-        let json = r#"{"eth_address":"0x00000000000000000000000000000000deadbeef","chain_id":84532,"campaign_id":"0x1111111111111111111111111111111111111111111111111111111111111111","owner":"o","name":"n","threshold":3}"#;
+        let json = r#"{"eth_address":"0x00000000000000000000000000000000deadbeef","chain_id":84532,"campaign_id":"0x1111111111111111111111111111111111111111111111111111111111111111","owner":"o","name":"n","threshold":3,"snapshot":1767225600}"#;
         let input: GuestInput = serde_json::from_str(json).expect("parse");
         assert_eq!(input.chain_id, 84532);
+        assert_eq!(input.snapshot, 1_767_225_600);
         let extra = json.replacen("{", "{\"x\":1,", 1);
         assert!(serde_json::from_str::<GuestInput>(&extra).is_err());
+        let missing = json.replacen(",\"snapshot\":1767225600", "", 1);
+        assert!(serde_json::from_str::<GuestInput>(&missing).is_err());
+    }
+
+    // ---- H1: account age -------------------------------------------------------
+
+    #[test]
+    fn account_must_predate_the_snapshot() {
+        let snapshot = 1_767_225_600; // 2026-01-01T00:00:00Z
+        assert!(check_account_age("2015-06-01T12:34:56Z", snapshot).is_ok());
+        assert!(check_account_age("2025-12-31T23:59:59Z", snapshot).is_ok());
+        assert!(matches!(
+            check_account_age("2026-01-01T00:00:00Z", snapshot),
+            Err(ClaimError::AccountTooNew {
+                created_at: 1_767_225_600,
+                snapshot: 1_767_225_600
+            })
+        ));
+        assert!(matches!(
+            check_account_age("2026-03-01T00:00:00Z", snapshot),
+            Err(ClaimError::AccountTooNew { .. })
+        ));
+        for bad in [
+            "2015-06-01T12:34:56.000Z",
+            "2015-06-01T12:34:56+00:00",
+            "",
+            "x",
+        ] {
+            assert!(
+                matches!(
+                    check_account_age(bad, snapshot),
+                    Err(ClaimError::CreatedAt(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    // ---- M1: fine-grained PATs only (synthetic transcripts) ------------------
+    //
+    // `check_transcript` sees exactly what the presentation proves: a partial
+    // transcript with the hidden ranges unknown. These build one directly, so
+    // every disclosure a dishonest prover could choose can be tried offline.
+    // Tokens are assembled at run time: no token-shaped literal in the repo.
+
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+
+    /// A token with the shape of a fine-grained PAT and `secret_len` bytes
+    /// after `github_pat_` (a real one has 82: 22, `_`, 59).
+    fn fine_grained(secret_len: usize) -> String {
+        let secret: String = (0..secret_len)
+            .map(|i| {
+                if i == 22 {
+                    '_'
+                } else {
+                    (b'a' + (i % 26) as u8) as char
+                }
+            })
+            .collect();
+        format!("{FINE_GRAINED_PAT_PREFIX}{secret}")
+    }
+
+    /// `<prefix>` + 36 characters: the shape of classic (`ghp_`), OAuth
+    /// (`gho_`), user-to-server (`ghu_`) and installation (`ghs_`) tokens.
+    fn short_token(prefix: &str) -> String {
+        format!("{prefix}{}", "Z".repeat(36))
+    }
+
+    /// The orc-shaped request with `value` as the authorization value, and the
+    /// value's transcript range.
+    fn request(value: &str) -> (Vec<u8>, Range<usize>) {
+        let head = "POST /graphql HTTP/1.1\r\nhost: api.github.com\r\nauthorization: ";
+        let sent = format!("{head}{value}\r\ncontent-length: 2\r\n\r\n{{}}");
+        (sent.into_bytes(), head.len()..head.len() + value.len())
+    }
+
+    /// Runs `check_transcript` on the request for `value`, with the ranges
+    /// `hide(value_range)` hidden and everything else (both directions) revealed.
+    fn check(
+        value: &str,
+        hide: impl FnOnce(Range<usize>) -> RangeSet<usize>,
+    ) -> Result<Exchange, ClaimError> {
+        let (sent, value_range) = request(value);
+        let mut reveal = RangeSet::from(0..sent.len());
+        // Range by range: `difference_mut` with an OWNED `RangeSet` argument
+        // did not terminate with rangeset 0.4.0 (observed: tests spinning at
+        // 100% CPU). `Range` and `&RangeSet` arguments are fine.
+        for range in hide(value_range).iter() {
+            reveal.difference_mut(range);
+        }
+        let partial = Transcript::new(sent, RESPONSE.to_vec())
+            .to_partial(reveal, RangeSet::from(0..RESPONSE.len()));
+        check_transcript(partial)
+    }
+
+    /// The honest disclosure: everything after `bearer github_pat_` hidden.
+    fn token_part(value: Range<usize>) -> RangeSet<usize> {
+        RangeSet::from(value.start + AUTH_VISIBLE_PREFIX.len()..value.end)
+    }
+
+    /// The pre-M1 disclosure: the whole value hidden, scheme included.
+    fn whole_value(value: Range<usize>) -> RangeSet<usize> {
+        RangeSet::from(value)
+    }
+
+    fn bearer(token: &str) -> String {
+        format!("bearer {token}")
+    }
+
+    #[test]
+    fn fine_grained_token_with_honest_disclosure_passes() {
+        let token = fine_grained(FINE_GRAINED_PAT_SECRET_LEN);
+        assert_eq!(token.len(), 93);
+        let exchange = check(&bearer(&token), token_part).expect("honest shape passes");
+        assert_eq!(exchange.request.request_line, request::REQUEST_LINE);
+        assert_eq!(exchange.response.status, 200);
+    }
+
+    #[test]
+    fn classic_oauth_and_app_tokens_are_rejected() {
+        for prefix in ["ghp_", "gho_", "ghu_", "ghs_"] {
+            let value = bearer(&short_token(prefix));
+            // Revealing the same 18 bytes an honest prover does shows the prefix.
+            assert!(
+                matches!(check(&value, token_part), Err(ClaimError::AuthPrefix)),
+                "{prefix} with the honest disclosure"
+            );
+            // Hiding the whole value (what orc did before M1) shows nothing.
+            assert!(
+                matches!(check(&value, whole_value), Err(ClaimError::AuthPrefix)),
+                "{prefix} fully hidden"
+            );
+        }
+    }
+
+    #[test]
+    fn fine_grained_token_fully_hidden_is_rejected() {
+        let value = bearer(&fine_grained(FINE_GRAINED_PAT_SECRET_LEN));
+        assert!(matches!(
+            check(&value, whole_value),
+            Err(ClaimError::AuthPrefix)
+        ));
+    }
+
+    #[test]
+    fn altered_visible_prefix_is_rejected() {
+        let token = fine_grained(FINE_GRAINED_PAT_SECRET_LEN);
+        for value in [
+            format!("Bearer {token}"),
+            format!("BEARER {token}"),
+            format!("token {token}"),
+            format!("bearer  {token}"),
+            format!("bearer x{}", &token[1..]),
+            format!(
+                "bearer github_pat-{}",
+                &token[FINE_GRAINED_PAT_PREFIX.len()..]
+            ),
+        ] {
+            assert!(
+                matches!(check(&value, token_part), Err(ClaimError::AuthPrefix)),
+                "{}",
+                &value[..20]
+            );
+        }
+        // Hiding any byte of the prefix (here the trailing `_`) is the same as
+        // not revealing it.
+        let value = bearer(&token);
+        assert!(matches!(
+            check(&value, |r| RangeSet::from(
+                r.start + AUTH_VISIBLE_PREFIX.len() - 1..r.end
+            )),
+            Err(ClaimError::AuthPrefix)
+        ));
+        // A value shorter than the prefix.
+        assert!(matches!(
+            check("bearer github", whole_value),
+            Err(ClaimError::AuthPrefix)
+        ));
+    }
+
+    #[test]
+    fn wrong_hidden_length_is_rejected() {
+        for len in [1, 40, 81, 83, 93, 120] {
+            let value = bearer(&fine_grained(len));
+            match check(&value, token_part) {
+                Err(ClaimError::AuthTokenLength { len: got, expected }) => {
+                    assert_eq!((got, expected), (len, FINE_GRAINED_PAT_SECRET_LEN));
+                }
+                other => panic!("secret length {len}: {other:?}"),
+            }
+        }
+        // Nothing hidden at all: `bearer github_pat_` with an empty token.
+        assert!(matches!(
+            check(&bearer(FINE_GRAINED_PAT_PREFIX), |_| RangeSet::default()),
+            Err(ClaimError::SentRedaction)
+        ));
+    }
+
+    #[test]
+    fn any_other_hidden_sent_byte_is_rejected() {
+        let value = bearer(&fine_grained(FINE_GRAINED_PAT_SECRET_LEN));
+        let token_start = |r: &Range<usize>| r.start + AUTH_VISIBLE_PREFIX.len();
+        // The first token byte revealed.
+        assert!(matches!(
+            check(&value, |r| RangeSet::from(token_start(&r) + 1..r.end)),
+            Err(ClaimError::SentRedaction)
+        ));
+        // The last token byte revealed.
+        assert!(matches!(
+            check(&value, |r| RangeSet::from(token_start(&r)..r.end - 1)),
+            Err(ClaimError::SentRedaction)
+        ));
+        // The token plus a byte of the request line (`P`).
+        assert!(matches!(
+            check(&value, |r| RangeSet::from([0..1, token_start(&r)..r.end])),
+            Err(ClaimError::Http(_) | ClaimError::SentRedaction)
+        ));
+        // The token plus the host value.
+        assert!(matches!(
+            check(&value, |r| RangeSet::from([30..44, token_start(&r)..r.end])),
+            Err(ClaimError::SentRedaction)
+        ));
+        // The token plus the CRLF after it: rejected, however it parses.
+        assert!(check(&value, |r| RangeSet::from(token_start(&r)..r.end + 2)).is_err());
+    }
+
+    #[test]
+    fn duplicate_authorization_header_is_rejected() {
+        let token = fine_grained(FINE_GRAINED_PAT_SECRET_LEN);
+        let head = "POST /graphql HTTP/1.1\r\nauthorization: bearer x\r\nauthorization: ";
+        let sent = format!("{head}{}\r\ncontent-length: 2\r\n\r\n{{}}", bearer(&token));
+        let start = head.len() + AUTH_VISIBLE_PREFIX.len();
+        let mut reveal = RangeSet::from(0..sent.len());
+        reveal.difference_mut(start..start + FINE_GRAINED_PAT_SECRET_LEN);
+        let partial = Transcript::new(sent.into_bytes(), RESPONSE.to_vec())
+            .to_partial(reveal, RangeSet::from(0..RESPONSE.len()));
+        assert!(matches!(
+            check_transcript(partial),
+            Err(ClaimError::Request(_))
+        ));
     }
 }

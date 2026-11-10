@@ -4,5 +4,6 @@
   "campaign_id": "0x0000000000000000000000000000000000000000000000000000000000000000",
   "owner": "tlsnotary",
   "name": "tlsn",
-  "threshold": 0
+  "threshold": 0,
+  "snapshot": 1767225600
 }

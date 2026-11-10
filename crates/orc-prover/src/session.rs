@@ -3,7 +3,8 @@
 //! Phases, each under [`ProverOptions::phase_timeout`]:
 //! 1. setup: MPC preprocessing with the notary;
 //! 2. online: TCP + MPC-TLS to the server, one HTTP request/response;
-//! 3. prove: commit (SHA-256) to everything the presentation will reveal;
+//! 3. prove: commit (SHA-256) to everything the presentation will reveal
+//!    (all but the token after `bearer github_pat_`);
 //! 4. attestation: send the request, receive and validate the signed attestation.
 
 use std::{
@@ -18,7 +19,8 @@ use hyper::{Request, body::Bytes, header};
 use hyper_util::rt::TokioIo;
 use orc_core::{
     GuestInput, binding_header_value, graphql_body,
-    request::{self, header as orc_header},
+    request::{self, AUTH_VISIBLE_PREFIX, header as orc_header},
+    time,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -64,12 +66,15 @@ const MAX_ATTESTATION_BYTES: u64 = 64 * 1024;
 
 /// What the presentation reveals.
 ///
-/// The default (everything except the `authorization` value) is the only
-/// disclosure `orc_core::verify_claim` accepts. The other knobs exist so
-/// tests can produce presentations the verifier must reject.
+/// The default (everything except the token after `bearer github_pat_` in
+/// the `authorization` value) is the only disclosure `orc_core::verify_claim`
+/// accepts. The other knobs exist so tests can produce presentations the
+/// verifier must reject.
 #[derive(Debug, Clone, Default)]
 pub struct Disclosure {
-    /// Also hide the values of these request headers (case-insensitive).
+    /// Also hide the WHOLE values of these request headers (case-insensitive).
+    /// Naming `authorization` hides the `bearer github_pat_` prefix too, which
+    /// is what orc did before it required fine-grained tokens.
     pub also_hide_request_headers: Vec<String>,
     /// Hide these byte ranges of the response (clipped to its length).
     pub hide_received: Vec<Range<usize>>,
@@ -148,7 +153,7 @@ impl Notarized {
     }
 
     /// Builds the presentation: server identity proof plus the committed
-    /// ranges (everything but the authorization value by default).
+    /// ranges (everything but the token by default).
     pub fn presentation(&self) -> Result<Presentation, ProverError> {
         let mut proof = self.secrets.transcript_proof_builder();
         proof.commitment_kinds(&[SHA256_KIND]);
@@ -392,7 +397,13 @@ fn build_request(
     input: &GuestInput,
     viewer_node_id: &str,
 ) -> Result<Request<Full<Bytes>>, ProverError> {
-    let body = graphql_body(&input.owner, &input.name, viewer_node_id);
+    let until = time::format_utc(input.snapshot).ok_or_else(|| {
+        ProverError::Invalid(format!(
+            "snapshot {} is past 9999-12-31T23:59:59Z",
+            input.snapshot
+        ))
+    })?;
+    let body = graphql_body(&input.owner, &input.name, viewer_node_id, &until);
     let binding = binding_header_value(input.eth_address, input.chain_id, input.campaign_id);
     Request::builder()
         .method(request::METHOD)
@@ -408,24 +419,40 @@ fn build_request(
         .stage("build request")
 }
 
-/// `(0..sent.len())` minus the `authorization` value (and any extra headers
-/// the disclosure hides).
+/// `(0..sent.len())` minus the token after `bearer github_pat_` in the
+/// `authorization` value (and the whole values of any headers the disclosure
+/// hides).
 fn sent_reveal_set(sent: &[u8], disclosure: &Disclosure) -> Result<RangeSet<usize>, ProverError> {
     let request = orc_core::http::parse_request(sent).stage("parse own request")?;
     let mut reveal: RangeSet<usize> = (0..sent.len()).into();
-    let mut auth_hidden = false;
+    let mut token_hidden = false;
     for h in &request.headers {
-        let is_auth = h.name.eq_ignore_ascii_case(orc_header::AUTHORIZATION);
         let extra = disclosure
             .also_hide_request_headers
             .iter()
             .any(|n| n.eq_ignore_ascii_case(&h.name));
-        if is_auth || extra {
+        if extra {
             reveal.difference_mut(&h.value_range);
-            auth_hidden |= is_auth;
+        }
+        if h.name.eq_ignore_ascii_case(orc_header::AUTHORIZATION) {
+            let value = match h.value_range.iter().collect::<Vec<_>>().as_slice() {
+                [range] => range.clone(),
+                _ => {
+                    return Err(ProverError::Invalid(
+                        "authorization value is not contiguous".into(),
+                    ));
+                }
+            };
+            if !h.value.starts_with(AUTH_VISIBLE_PREFIX.as_bytes()) {
+                return Err(ProverError::Invalid(format!(
+                    "authorization value does not start with {AUTH_VISIBLE_PREFIX:?}"
+                )));
+            }
+            reveal.difference_mut(value.start + AUTH_VISIBLE_PREFIX.len()..value.end);
+            token_hidden = true;
         }
     }
-    if !auth_hidden {
+    if !token_hidden {
         return Err(ProverError::Invalid(
             "request has no authorization header to hide".into(),
         ));

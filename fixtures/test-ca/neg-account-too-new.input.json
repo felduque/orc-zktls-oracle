@@ -1,0 +1,9 @@
+{
+  "eth_address": "0x1111111111111111111111111111111111111111",
+  "chain_id": 84532,
+  "campaign_id": "0x3276d4db55236b1233bcbdbb1e39216717f562a0841d80ca8c24a53204668aab",
+  "owner": "tlsnotary",
+  "name": "tlsn",
+  "threshold": 10,
+  "snapshot": 1767225600
+}
