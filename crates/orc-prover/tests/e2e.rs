@@ -9,7 +9,7 @@ mod harness;
 
 use std::{
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use harness::{
@@ -20,7 +20,7 @@ use orc_core::{
     Address, B256, ClaimError, GuestInput, PublicValues, VerifyParams, http, nullifier,
     verify_claim,
 };
-use orc_prover::Disclosure;
+use orc_prover::{Disclosure, ProverError};
 use tokio::sync::OnceCell;
 
 static HONEST: OnceCell<Run> = OnceCell::const_new();
@@ -289,20 +289,27 @@ async fn truncated_close_delimited_response_fails() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn notary_rejects_oversized_transcript_budget() {
+    // Long, so a slow shared runner is never mistaken for a hang; shorter than
+    // the harness notary's 120 s session timeout, so a lost rejection trips
+    // the prover's own timeout rather than the notary's.
+    let phase_timeout = Duration::from_secs(90);
     let scenario = Scenario {
         max_recv_data: Some(2 * orc_notary::DEFAULT_MAX_RECV_DATA),
         attempts: Some(1),
+        phase_timeout: Some(phase_timeout),
         ..Scenario::default()
     };
-    let started = std::time::Instant::now();
-    let result = harness::run(Reply::ok(Framing::ContentLength), scenario).await;
+    let (result, elapsed) = harness::run_timed(Reply::ok(Framing::ContentLength), scenario).await;
     let Err(err) = result else {
         panic!("the notary must refuse a 32 KiB response budget");
     };
     // The rejection reaches the prover; it does not wait for a phase timeout.
-    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+    let timed_out = matches!(err, ProverError::Timeout { .. });
     let chain = format!("{:?}", anyhow::Error::from(err));
+    assert!(!timed_out && !chain.contains("timed out after"), "{chain}");
     assert!(chain.contains("rejected"), "{chain}");
+    // Secondary: far from the deadline (queueing for an MPC slot excluded).
+    assert!(elapsed < phase_timeout / 2, "took {elapsed:?} of a {phase_timeout:?} phase timeout");
 }
 
 // ---- fixtures for the SP1 guest (M2) ------------------------------------------

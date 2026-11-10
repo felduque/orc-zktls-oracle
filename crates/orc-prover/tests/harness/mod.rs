@@ -3,7 +3,11 @@
 //! preflight and serves one canned GraphQL reply per scenario, with
 //! selectable HTTP framing. The real orc notary runs on another local port.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use orc_core::{
     Address, B256, GuestInput, VerifyParams,
@@ -286,6 +290,8 @@ pub struct Scenario {
     /// Ask the notary for this MPC response budget.
     pub max_recv_data: Option<usize>,
     pub attempts: Option<u32>,
+    /// Prover deadline per session phase (default 20 s).
+    pub phase_timeout: Option<Duration>,
 }
 
 pub struct Run {
@@ -297,8 +303,19 @@ pub struct Run {
 /// Runs preflight + MPC-TLS + attestation + presentation against a local
 /// server serving `reply`, with a fresh local notary.
 pub async fn run(reply: Reply, scenario: Scenario) -> Result<Run, ProverError> {
-    let _slot = MPC_SLOTS.acquire().await.expect("semaphore");
+    run_timed(reply, scenario).await.0
+}
 
+/// [`run`], plus how long the scenario took once it held an MPC slot: time
+/// spent queueing behind other tests' sessions is not counted.
+pub async fn run_timed(reply: Reply, scenario: Scenario) -> (Result<Run, ProverError>, Duration) {
+    let _slot = MPC_SLOTS.acquire().await.expect("semaphore");
+    let started = Instant::now();
+    let result = run_session(reply, scenario).await;
+    (result, started.elapsed())
+}
+
+async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverError> {
     let server = spawn_server(reply).await;
     let key = if scenario.p256_notary {
         NotaryKey::secp256r1(NOTARY_SECRET).expect("p256 key")
@@ -315,7 +332,7 @@ pub async fn run(reply: Reply, scenario: Scenario) -> Result<Run, ProverError> {
     let token = GithubToken::new(TOKEN).expect("token");
     let mut opts = ProverOptions {
         // Local phases take ~1 s; a hang (see spike m0b) is cut at 20 s and retried.
-        phase_timeout: Duration::from_secs(20),
+        phase_timeout: scenario.phase_timeout.unwrap_or(Duration::from_secs(20)),
         disclosure: scenario.disclosure,
         ..ProverOptions::default()
     };
