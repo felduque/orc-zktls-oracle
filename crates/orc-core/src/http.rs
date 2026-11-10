@@ -238,7 +238,10 @@ fn parse_response_fallback(recv: &[u8], spansy_err: &str) -> Result<HttpResponse
         })
         .collect::<Result<Vec<_>, HttpError>>()?;
 
-    if headers_named(&headers, "transfer-encoding").next().is_some() {
+    if headers_named(&headers, "transfer-encoding")
+        .next()
+        .is_some()
+    {
         // Chunked (or other codings) must go through spansy.
         return Err(HttpError::Response(spansy_err.to_owned()));
     }
@@ -321,7 +324,8 @@ mod tests {
 
     #[test]
     fn close_delimited_response_uses_fallback() {
-        let raw = format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{BODY}");
+        let raw =
+            format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\r\n{BODY}");
         let r = parse_response(raw.as_bytes()).expect("parse");
         assert_eq!(r.status, 401);
         assert_eq!(r.framing, Framing::CloseDelimited);

@@ -149,7 +149,9 @@ pub async fn spawn_server(reply: Reply) -> TestServer {
         .expect("protocol versions")
         .with_no_client_auth()
         .with_single_cert(
-            vec![rustls::pki_types::CertificateDer::from(SERVER_CERT_DER.to_vec())],
+            vec![rustls::pki_types::CertificateDer::from(
+                SERVER_CERT_DER.to_vec(),
+            )],
             rustls::pki_types::PrivateKeyDer::Pkcs8(SERVER_KEY_DER.to_vec().into()),
         )
         .expect("server cert");
@@ -347,7 +349,10 @@ async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverErro
     }
 
     let viewer = preflight::viewer_node_id(&target, &token, Duration::from_secs(30)).await?;
-    assert_eq!(viewer, VIEWER_ID, "preflight must return the server's viewer id");
+    assert_eq!(
+        viewer, VIEWER_ID,
+        "preflight must return the server's viewer id"
+    );
     let viewer = scenario.viewer_override.unwrap_or(viewer);
 
     let input = input();

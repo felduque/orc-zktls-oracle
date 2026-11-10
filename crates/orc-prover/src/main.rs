@@ -12,7 +12,11 @@ use orc_core::{Address, B256, GuestInput, VerifyParams, verify_claim};
 use orc_prover::{GithubToken, ProverOptions, Target, preflight, prove};
 
 #[derive(Debug, Parser)]
-#[command(name = "orc", version, about = "zk-TLS GitHub commit-count prover (TLSNotary)")]
+#[command(
+    name = "orc",
+    version,
+    about = "zk-TLS GitHub commit-count prover (TLSNotary)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -59,8 +63,7 @@ struct ProveArgs {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -91,7 +94,10 @@ async fn run_prove(args: ProveArgs) -> Result<()> {
     let viewer_id = preflight::viewer_node_id(&target, &token, opts.phase_timeout).await?;
     println!("      viewer.id = {viewer_id}");
 
-    println!("[2/3] MPC-TLS with notary {} -> {}", args.notary, target.connect_addr);
+    println!(
+        "[2/3] MPC-TLS with notary {} -> {}",
+        args.notary, target.connect_addr
+    );
     let outcome = prove(&args.notary, &target, &token, &input, &viewer_id, &opts).await?;
     for reason in &outcome.retry_reasons {
         println!("      retried after: {reason}");
@@ -133,7 +139,10 @@ async fn run_prove(args: ProveArgs) -> Result<()> {
     match verify_claim(&outcome.presentation, &input, &VerifyParams::github()) {
         Ok(pv) => {
             println!("{pv}");
-            println!("abi.encode(PublicValues) = 0x{}", hex::encode(pv.to_abi_bytes()));
+            println!(
+                "abi.encode(PublicValues) = 0x{}",
+                hex::encode(pv.to_abi_bytes())
+            );
             Ok(())
         }
         Err(e) => bail!("self-check failed: {e}"),

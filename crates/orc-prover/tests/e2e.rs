@@ -55,7 +55,11 @@ fn assert_honest_public_values(run: &Run, pv: &PublicValues) {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    assert!(pv.sessionTime.abs_diff(now) < 600, "sessionTime {}", pv.sessionTime);
+    assert!(
+        pv.sessionTime.abs_diff(now) < 600,
+        "sessionTime {}",
+        pv.sessionTime
+    );
 }
 
 macro_rules! assert_err {
@@ -73,7 +77,10 @@ macro_rules! assert_err {
 async fn honest_content_length_response_verifies() {
     let run = honest().await;
     assert_eq!(run.outcome.http_status, 200);
-    assert_eq!(run.outcome.response_framing, Some(http::Framing::ContentLength));
+    assert_eq!(
+        run.outcome.response_framing,
+        Some(http::Framing::ContentLength)
+    );
     let pv = verify(run, &run.input).expect("claim verifies");
     assert_honest_public_values(run, &pv);
     assert_eq!(pv.to_abi_bytes().len(), 256);
@@ -98,7 +105,10 @@ async fn chunked_response_verifies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn close_delimited_response_verifies() {
     let run = run(Reply::ok(Framing::CloseDelimited), Scenario::default()).await;
-    assert_eq!(run.outcome.response_framing, Some(http::Framing::CloseDelimited));
+    assert_eq!(
+        run.outcome.response_framing,
+        Some(http::Framing::CloseDelimited)
+    );
     let pv = verify(&run, &run.input).expect("claim verifies");
     assert_honest_public_values(&run, &pv);
 }
@@ -123,7 +133,10 @@ async fn count_below_threshold_fails() {
         threshold: COMMITS + 1,
         ..run.input.clone()
     };
-    assert_err!(verify(run, &input), ClaimError::BelowThreshold { count: COMMITS, .. });
+    assert_err!(
+        verify(run, &input),
+        ClaimError::BelowThreshold { count: COMMITS, .. }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -177,8 +190,8 @@ async fn tampered_presentation_bytes_fail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrong_server_name_fails() {
     let run = honest().await;
-    let params = VerifyParams::with_root_store("api.github.com", &harness::test_roots())
-        .expect("params");
+    let params =
+        VerifyParams::with_root_store("api.github.com", &harness::test_roots()).expect("params");
     assert_err!(
         verify_claim(&run.outcome.presentation, &run.input, &params),
         ClaimError::ServerName { .. }
@@ -189,7 +202,11 @@ async fn wrong_server_name_fails() {
 async fn production_roots_reject_the_test_ca() {
     let run = honest().await;
     assert_err!(
-        verify_claim(&run.outcome.presentation, &run.input, &VerifyParams::github()),
+        verify_claim(
+            &run.outcome.presentation,
+            &run.input,
+            &VerifyParams::github()
+        ),
         ClaimError::Presentation(_)
     );
 }
@@ -234,6 +251,9 @@ async fn extra_hidden_sent_range_fails() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hidden_received_range_fails() {
+    // `hide_received` is a list of byte ranges: ONE range (bytes 0..8) is exactly
+    // what this test means, not the numbers 0..8 nor a Vec of length 8.
+    #[allow(clippy::single_range_in_vec_init)]
     let scenario = Scenario {
         disclosure: Disclosure {
             hide_received: vec![0..8],
@@ -271,8 +291,9 @@ async fn graphql_errors_key_fails() {
 async fn non_200_status_fails() {
     let reply = Reply {
         status_line: "HTTP/1.1 401 Unauthorized",
-        body: r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/graphql"}"#
-            .into(),
+        body:
+            r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/graphql"}"#
+                .into(),
         framing: Framing::ContentLength,
     };
     let run = run(reply, Scenario::default()).await;
@@ -283,7 +304,10 @@ async fn non_200_status_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncated_close_delimited_response_fails() {
     let run = run(Reply::ok(Framing::TruncatedClose), Scenario::default()).await;
-    assert_eq!(run.outcome.response_framing, Some(http::Framing::CloseDelimited));
+    assert_eq!(
+        run.outcome.response_framing,
+        Some(http::Framing::CloseDelimited)
+    );
     assert_err!(verify(&run, &run.input), ClaimError::ResponseJson(_));
 }
 
@@ -309,7 +333,10 @@ async fn notary_rejects_oversized_transcript_budget() {
     assert!(!timed_out && !chain.contains("timed out after"), "{chain}");
     assert!(chain.contains("rejected"), "{chain}");
     // Secondary: far from the deadline (queueing for an MPC slot excluded).
-    assert!(elapsed < phase_timeout / 2, "took {elapsed:?} of a {phase_timeout:?} phase timeout");
+    assert!(
+        elapsed < phase_timeout / 2,
+        "took {elapsed:?} of a {phase_timeout:?} phase timeout"
+    );
 }
 
 // ---- fixtures for the SP1 guest (M2) ------------------------------------------
@@ -346,17 +373,26 @@ async fn dump_test_ca_fixtures() {
     let content_length = honest().await;
     write_run("content-length", content_length);
     let chunked = run(Reply::ok(Framing::Chunked), Scenario::default()).await;
-    assert_eq!(chunked.outcome.response_framing, Some(http::Framing::Chunked));
+    assert_eq!(
+        chunked.outcome.response_framing,
+        Some(http::Framing::Chunked)
+    );
     write_run("chunked", &chunked);
     let close = run(Reply::ok(Framing::CloseDelimited), Scenario::default()).await;
-    assert_eq!(close.outcome.response_framing, Some(http::Framing::CloseDelimited));
+    assert_eq!(
+        close.outcome.response_framing,
+        Some(http::Framing::CloseDelimited)
+    );
     write_run("close-delimited", &close);
 
     let wrong_binding = GuestInput {
         eth_address: Address::repeat_byte(0x33),
         ..content_length.input.clone()
     };
-    assert_err!(verify(content_length, &wrong_binding), ClaimError::BindingMismatch);
+    assert_err!(
+        verify(content_length, &wrong_binding),
+        ClaimError::BindingMismatch
+    );
     write_input("neg-wrong-binding", &wrong_binding);
 
     let below_threshold = GuestInput {

@@ -148,10 +148,21 @@ mod tests {
 
     #[test]
     fn escaping_matches_serde_json() {
-        for s in ["plain", "q\"uote", "back\\slash", "nl\n cr\r tab\t", "\u{1}\u{1f}\u{7f}", "ünï"] {
+        for s in [
+            "plain",
+            "q\"uote",
+            "back\\slash",
+            "nl\n cr\r tab\t",
+            "\u{1}\u{1f}\u{7f}",
+            "ünï",
+        ] {
             let mut ours = String::new();
             push_json_string(&mut ours, s);
-            assert_eq!(ours, serde_json::to_string(s).expect("serialize"), "input {s:?}");
+            assert_eq!(
+                ours,
+                serde_json::to_string(s).expect("serialize"),
+                "input {s:?}"
+            );
         }
     }
 
@@ -159,12 +170,21 @@ mod tests {
     fn valid_response_parses() {
         let r = parse_response(VALID.as_bytes()).expect("parse");
         assert_eq!(r.data.viewer.id, "U_kgDOAAA");
-        assert_eq!(r.data.repository.default_branch_ref.target.history.total_count, 42);
+        assert_eq!(
+            r.data
+                .repository
+                .default_branch_ref
+                .target
+                .history
+                .total_count,
+            42
+        );
     }
 
     #[test]
     fn errors_key_is_rejected() {
-        let with_errors = VALID.replacen("{\"data\"", "{\"errors\":[{\"message\":\"x\"}],\"data\"", 1);
+        let with_errors =
+            VALID.replacen("{\"data\"", "{\"errors\":[{\"message\":\"x\"}],\"data\"", 1);
         assert!(parse_response(with_errors.as_bytes()).is_err());
     }
 
@@ -176,20 +196,28 @@ mod tests {
 
     #[test]
     fn null_repository_is_rejected() {
-        let null_repo = r#"{"data":{"viewer":{"login":"o","databaseId":1,"id":"U"},"repository":null}}"#;
+        let null_repo =
+            r#"{"data":{"viewer":{"login":"o","databaseId":1,"id":"U"},"repository":null}}"#;
         assert!(parse_response(null_repo.as_bytes()).is_err());
     }
 
     #[test]
     fn truncation_is_rejected_at_every_cut() {
         for cut in 0..VALID.len() {
-            assert!(parse_response(&VALID.as_bytes()[..cut]).is_err(), "cut at {cut}");
+            assert!(
+                parse_response(&VALID.as_bytes()[..cut]).is_err(),
+                "cut at {cut}"
+            );
         }
     }
 
     #[test]
     fn duplicate_key_is_rejected() {
-        let dup = VALID.replacen("\"login\":\"octo\"", "\"login\":\"octo\",\"login\":\"evil\"", 1);
+        let dup = VALID.replacen(
+            "\"login\":\"octo\"",
+            "\"login\":\"octo\",\"login\":\"evil\"",
+            1,
+        );
         assert!(parse_response(dup.as_bytes()).is_err());
     }
 }

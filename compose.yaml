@@ -32,6 +32,11 @@ services:
       # Only the Groth16/PLONK circuit artifacts. Never mount all of ~/.sp1:
       # that would hide cargo-prove and the toolchains baked into the image.
       - sp1-circuits:/home/dev/.sp1/circuits
+      # Encrypted Foundry keystores (`cast wallet import`), e.g. the Base Sepolia
+      # testnet deployer. They stay on the host, outside the repo. Run
+      # `mkdir -p ~/.foundry/keystores` first: Docker creates a missing bind
+      # source as root. Only this subdirectory, so the image's Foundry stays visible.
+      - ${HOME}/.foundry/keystores:/home/dev/.foundry/keystores
     # SP1 v6's native executor shares guest memory and trace buffers with a
     # child process through POSIX shm (/dev/shm). Docker's 64 MB default makes
     # the child die with SIGBUS ("Child native executor crashed ... signal: 7").

@@ -121,5 +121,12 @@ RUN set -eux; \
     rm -rf /usr/local/cargo/registry/* /usr/local/cargo/git/*
 ENV SP1_CORE_RUNNER_OVERRIDE_BINARY=/usr/local/cargo/bin/sp1-core-executor-runner-binary
 
+# rustfmt + clippy for the pinned toolchain (the rust image installs the minimal
+# profile, without them). Last on purpose so adding it does not invalidate the
+# expensive SP1/Foundry layers above; the official image leaves RUSTUP_HOME
+# world-writable, so the non-root user can add components.
+ARG RUST_VERSION
+RUN rustup component add --toolchain "${RUST_VERSION}" rustfmt clippy
+
 WORKDIR /workspace
 CMD ["bash"]

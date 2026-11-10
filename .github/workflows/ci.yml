@@ -3,8 +3,9 @@
 # Deliberately NOT built here: the SP1 guest (program/) and its host
 # (crates/orc-script). They need the SP1 toolchain, the riscv64 C toolchain,
 # protoc + libprotobuf-dev and several GB of build artifacts; that is too heavy
-# for CI runners. Build and check them in the Docker dev env (see README), and
-# compare `orc-script vkey` against the documented production vkey.
+# for CI runners. Build, clippy and check them in the Docker dev env (see
+# README), and compare `orc-script vkey` against the documented production vkey.
+# Only their formatting is checked here (rustfmt needs no build).
 name: CI
 
 on:
@@ -25,7 +26,7 @@ env:
 
 jobs:
   rust:
-    name: cargo test (root workspace)
+    name: fmt + clippy + test (root workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -34,10 +35,29 @@ jobs:
         with:
           persist-credentials: false
 
-      # Same Rust as the dev image (docker/Dockerfile, rust:1.99.1-trixie).
+      # Same Rust as the dev image (docker/Dockerfile, rust:1.99.1-trixie),
+      # plus the same rustfmt/clippy components it adds.
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+
+      # Default rustfmt config (no rustfmt.toml). Formatting the guest's code
+      # (program/, crates/orc-core) can change the ELF and so the program vkey:
+      # panic locations (file:line:col) are compiled in.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      # program/ and crates/orc-script are separate workspaces (see above);
+      # plain rustfmt follows their `mod` trees without resolving their deps.
+      - name: rustfmt --check (program, orc-script)
+        run: >-
+          rustfmt --check --edition 2024
+          program/src/main.rs crates/orc-script/build.rs crates/orc-script/src/main.rs
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # No system packages needed: the root workspace's only native build
       # dependency is ring (C, built with the runner's cc). protoc and
@@ -53,7 +73,7 @@ jobs:
         run: cargo test --workspace --locked
 
   contracts:
-    name: forge build + test
+    name: forge fmt + build + test
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -69,6 +89,10 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: v1.8.7
+
+      # [fmt] settings live in contracts/foundry.toml (line_length 100).
+      - name: forge fmt --check
+        run: forge fmt --check
 
       - name: forge build
         run: forge build

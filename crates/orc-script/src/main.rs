@@ -15,6 +15,7 @@
 //! Build with `--features profiling` for the per-phase cycle breakdown.
 
 use std::{
+    cmp::Reverse,
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -29,8 +30,17 @@ use sp1_sdk::{
     blocking::{ProveRequest, Prover, ProverClient, SP1ProofMode, SP1Stdin},
 };
 
+#[cfg(not(clippy))]
 const PRODUCTION_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/elf/orc-program"));
+#[cfg(not(clippy))]
 const TEST_CA_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/elf/orc-program-test-ca"));
+// sp1-build skips the guest build under `cargo clippy` (RUSTC_WORKSPACE_WRAPPER is
+// clippy-driver), so the ELFs above do not exist there. `cfg(clippy)` is only set by
+// clippy-driver, which never links a binary, so these empty stand-ins cannot ship.
+#[cfg(clippy)]
+const PRODUCTION_ELF: &[u8] = &[];
+#[cfg(clippy)]
+const TEST_CA_ELF: &[u8] = &[];
 
 const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
@@ -157,7 +167,11 @@ enum Program {
 
 impl Program {
     fn new(test_ca: bool) -> Self {
-        if test_ca { Self::TestCa } else { Self::Production }
+        if test_ca {
+            Self::TestCa
+        } else {
+            Self::Production
+        }
     }
 
     fn elf(self) -> Elf {
@@ -296,7 +310,11 @@ fn execute(args: &ClaimArgs) -> Result<()> {
 
     match (&claim.native, report.exit_code) {
         (Ok(native), 0) => {
-            println!("[guest] committed {} B: 0x{}", committed.len(), hex::encode(committed));
+            println!(
+                "[guest] committed {} B: 0x{}",
+                committed.len(),
+                hex::encode(committed)
+            );
             ensure!(
                 committed == native.to_abi_bytes().as_slice(),
                 "guest public values differ from the native verify_claim\n\
@@ -305,19 +323,27 @@ fn execute(args: &ClaimArgs) -> Result<()> {
                 hex::encode(native.to_abi_bytes())
             );
             println!("{native}");
-            println!("[check] OK: guest ACCEPTED; public values byte-identical to native verify_claim");
+            println!(
+                "[check] OK: guest ACCEPTED; public values byte-identical to native verify_claim"
+            );
         }
         (Err(native_err), code) if code != 0 => {
             let expected = format!("orc claim rejected: {native_err}");
             println!("[guest] exit code {code}; stderr: {}", guest_stderr.trim());
-            ensure!(committed.is_empty(), "a rejecting guest committed {} B", committed.len());
+            ensure!(
+                committed.is_empty(),
+                "a rejecting guest committed {} B",
+                committed.len()
+            );
             ensure!(
                 guest_stderr.contains(&expected),
                 "guest panic does not carry the native error {expected:?}"
             );
             println!("[check] OK: guest REJECTED (panic) with the native error: {native_err}");
         }
-        (Ok(_), code) => bail!("native accepts, but the guest exited with code {code}: {guest_stderr}"),
+        (Ok(_), code) => {
+            bail!("native accepts, but the guest exited with code {code}: {guest_stderr}")
+        }
         (Err(e), _) => bail!("native rejects ({e}), but the guest exited with code 0"),
     }
     Ok(())
@@ -359,9 +385,15 @@ fn prove(args: &ProveArgs) -> Result<()> {
     println!("[prove] cpu prover init {:.2?}", started.elapsed());
 
     let started = Instant::now();
-    let pk = client.setup(claim.program.elf()).map_err(|e| anyhow!("setup: {e}"))?;
+    let pk = client
+        .setup(claim.program.elf())
+        .map_err(|e| anyhow!("setup: {e}"))?;
     let vk = pk.verifying_key();
-    println!("[prove] setup {:.2?} | program vkey {}", started.elapsed(), vk.bytes32());
+    println!(
+        "[prove] setup {:.2?} | program vkey {}",
+        started.elapsed(),
+        vk.bytes32()
+    );
 
     let started = Instant::now();
     let proof = client
@@ -369,9 +401,15 @@ fn prove(args: &ProveArgs) -> Result<()> {
         .mode(args.system.mode())
         .run()
         .map_err(|e| anyhow!("prove {}: {e}", args.system.name()))?;
-    println!("[prove] {} proof in {:.2?}", args.system.name(), started.elapsed());
+    println!(
+        "[prove] {} proof in {:.2?}",
+        args.system.name(),
+        started.elapsed()
+    );
 
-    client.verify(&proof, vk, None).map_err(|e| anyhow!("verify: {e}"))?;
+    client
+        .verify(&proof, vk, None)
+        .map_err(|e| anyhow!("verify: {e}"))?;
     check_public_values(&proof, native)?;
     println!("[prove] proof verifies; public values match native");
 
@@ -379,18 +417,26 @@ fn prove(args: &ProveArgs) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let bin = out.with_extension("bin");
-    proof.save(&bin).map_err(|e| anyhow!("save {}: {e}", bin.display()))?;
+    proof
+        .save(&bin)
+        .map_err(|e| anyhow!("save {}: {e}", bin.display()))?;
     println!("[prove] bincode proof -> {}", bin.display());
     if args.system.on_chain() {
         write_fixture(&out, &vk.bytes32(), &proof)?;
     } else {
-        println!("[prove] {} proofs have no on-chain encoding; no JSON fixture", args.system.name());
+        println!(
+            "[prove] {} proofs have no on-chain encoding; no JSON fixture",
+            args.system.name()
+        );
     }
     Ok(())
 }
 
 fn fixture(args: &FixtureArgs) -> Result<()> {
-    ensure!(args.mock, "only --mock fixtures are made here; use `prove --system groth16|plonk`");
+    ensure!(
+        args.mock,
+        "only --mock fixtures are made here; use `prove --system groth16|plonk`"
+    );
     let claim = Claim::load(
         Path::new(&args.presentation),
         Path::new(&args.input),
@@ -399,7 +445,9 @@ fn fixture(args: &FixtureArgs) -> Result<()> {
     let native = claim.accepted()?;
 
     let client = ProverClient::builder().mock().build();
-    let pk = client.setup(claim.program.elf()).map_err(|e| anyhow!("setup: {e}"))?;
+    let pk = client
+        .setup(claim.program.elf())
+        .map_err(|e| anyhow!("setup: {e}"))?;
     let vk = pk.verifying_key();
     // The mock prover executes the guest and returns an empty Groth16 proof
     // (what SP1MockVerifier expects).
@@ -408,9 +456,14 @@ fn fixture(args: &FixtureArgs) -> Result<()> {
         .mode(SP1ProofMode::Groth16)
         .run()
         .map_err(|e| anyhow!("mock prove: {e}"))?;
-    client.verify(&proof, vk, None).map_err(|e| anyhow!("mock verify: {e}"))?;
+    client
+        .verify(&proof, vk, None)
+        .map_err(|e| anyhow!("mock verify: {e}"))?;
     check_public_values(&proof, native)?;
-    ensure!(proof.bytes().is_empty(), "a mock proof must have empty proof bytes");
+    ensure!(
+        proof.bytes().is_empty(),
+        "a mock proof must have empty proof bytes"
+    );
 
     write_fixture(Path::new(&args.out), &vk.bytes32(), &proof)?;
     println!("{native}");
@@ -446,7 +499,9 @@ fn print_report(report: &ExecutionReport, wall: Duration) {
         report.exit_code,
         report.total_instruction_count(),
         report.total_syscall_count(),
-        report.gas().map_or_else(|| "n/a".to_owned(), |g| g.to_string()),
+        report
+            .gas()
+            .map_or_else(|| "n/a".to_owned(), |g| g.to_string()),
     );
 
     let mut syscalls: Vec<_> = report
@@ -455,7 +510,7 @@ fn print_report(report: &ExecutionReport, wall: Duration) {
         .filter(|(_, n)| **n > 0)
         .map(|(code, n)| (format!("{code:?}"), *n))
         .collect();
-    syscalls.sort_by(|a, b| b.1.cmp(&a.1));
+    syscalls.sort_by_key(|&(_, n)| Reverse(n));
     println!("[exec] syscalls (non-zero): {syscalls:?}");
 
     if report.cycle_tracker.is_empty() {

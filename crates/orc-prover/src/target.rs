@@ -1,10 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use hyper::header::HeaderValue;
-use orc_core::{
-    DEFAULT_MAX_AUTH_VALUE_LEN, GITHUB_API_HOST,
-    request::AUTH_SCHEME_PREFIX,
-};
+use orc_core::{DEFAULT_MAX_AUTH_VALUE_LEN, GITHUB_API_HOST, request::AUTH_SCHEME_PREFIX};
 use tlsn::{connection::ServerName, webpki::RootCertStore};
 
 use crate::error::{ProverError, StageExt};

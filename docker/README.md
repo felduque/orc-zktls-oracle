@@ -10,6 +10,7 @@ The whole toolchain lives in one image so it is identical on every machine
 | RISC-V C toolchain | `~/.sp1/bin/riscv64-unknown-elf-gcc` (`CC_riscv64im_succinct_zkvm_elf` is set) |
 | Go (for sp1-sdk `native-gnark`) | 1.26.10, `GOTOOLCHAIN=local` |
 | Foundry | v1.8.7 via foundryup 0.0.8 |
+| rustfmt, clippy | components of the pinned Rust toolchain (same as CI) |
 | clang, protoc (+ libprotobuf-dev well-known types) | Debian trixie packages |
 
 All versions are build args at the top of `docker/Dockerfile`.
@@ -26,6 +27,7 @@ user gets your UID/GID. Do this once per machine:
 
 ```bash
 printf 'DEV_UID=%s\nDEV_GID=%s\n' "$(id -u)" "$(id -g)" > .env   # gitignored
+mkdir -p ~/.foundry/keystores   # see "Foundry keystores" below
 docker compose build
 ```
 
@@ -63,6 +65,23 @@ docker compose run --rm dev cargo prove --version # one-off command
   execute/prove fails instantly with `failed sending input to child: io error:
   Broken pipe`. Keep its version equal to sp1-sdk's (both follow `SP1_VERSION`).
 - `docker compose down -v` deletes the volumes (caches and circuits).
+
+## Foundry keystores
+
+`~/.foundry/keystores` on the host is bind-mounted at `/home/dev/.foundry/keystores`, for
+encrypted Foundry keystores such as the Base Sepolia (testnet) deployer wallet. The keys stay on
+the host, outside the repo, and are never baked into the image. Only that subdirectory is
+mounted, so the Foundry binaries in the image stay visible.
+
+Create the directory **before** the first `docker compose run`:
+
+```bash
+mkdir -p ~/.foundry/keystores
+```
+
+Docker creates a missing bind-mount source itself, owned by root, and the container user then
+cannot write to it (fix with `sudo chown "$(id -u):$(id -g)" ~/.foundry/keystores`). The mount
+is read-write, so `cast wallet import` inside the container writes to the host directory.
 
 ## Another machine
 

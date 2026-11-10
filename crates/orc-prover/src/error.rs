@@ -9,7 +9,10 @@ pub enum ProverError {
     Invalid(String),
 
     #[error("{phase} timed out after {after:?}")]
-    Timeout { phase: &'static str, after: Duration },
+    Timeout {
+        phase: &'static str,
+        after: Duration,
+    },
 
     #[error("{stage}: {source}")]
     Stage {

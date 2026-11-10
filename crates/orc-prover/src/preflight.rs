@@ -130,6 +130,9 @@ mod tests {
     #[test]
     fn graphql_errors_fail() {
         let body = br#"{"data":null,"errors":[{"message":"nope"}]}"#;
-        assert!(matches!(parse_viewer_id(body), Err(ProverError::Preflight(_))));
+        assert!(matches!(
+            parse_viewer_id(body),
+            Err(ProverError::Preflight(_))
+        ));
     }
 }

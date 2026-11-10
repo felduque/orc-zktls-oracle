@@ -14,7 +14,11 @@ use orc_notary::{
 use tokio::net::TcpListener;
 
 #[derive(Debug, Parser)]
-#[command(name = "orc-notary", version, about = "orc TLSNotary notary (MPC-TLS verifier + secp256k1 attestation signer)")]
+#[command(
+    name = "orc-notary",
+    version,
+    about = "orc TLSNotary notary (MPC-TLS verifier + secp256k1 attestation signer)"
+)]
 struct Args {
     /// Address to listen on.
     #[arg(long, env = "ORC_NOTARY_LISTEN", default_value = "0.0.0.0:7047")]

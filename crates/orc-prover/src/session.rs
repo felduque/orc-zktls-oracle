@@ -242,10 +242,7 @@ where
             .await
             .stage("read response")?;
 
-        let prover = prover_task
-            .await
-            .stage("MPC-TLS task")?
-            .stage("MPC-TLS")?;
+        let prover = prover_task.await.stage("MPC-TLS task")?.stage("MPC-TLS")?;
         Ok((prover, status))
     })
     .await?;
@@ -442,7 +439,7 @@ fn recv_reveal_set(recv_len: usize, disclosure: &Disclosure) -> RangeSet<usize> 
     for range in &disclosure.hide_received {
         let clipped = range.start.min(recv_len)..range.end.min(recv_len);
         if !clipped.is_empty() {
-            reveal.difference_mut(&RangeSet::from(clipped));
+            reveal.difference_mut(clipped);
         }
     }
     reveal

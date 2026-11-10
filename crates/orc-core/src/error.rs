@@ -55,7 +55,9 @@ pub enum ClaimError {
     #[error("x-orc-binding does not match the guest input")]
     BindingMismatch,
 
-    #[error("request body is not the canonical GraphQL body for this input and the authenticated viewer")]
+    #[error(
+        "request body is not the canonical GraphQL body for this input and the authenticated viewer"
+    )]
     BodyMismatch,
 
     #[error("HTTP status {0}, expected 200")]

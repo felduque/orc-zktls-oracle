@@ -225,8 +225,16 @@ where
         VerifierCommitStart::Mpc(verifier) => {
             let requested = verifier.config();
             let limits = [
-                ("max_sent_data", requested.max_sent_data(), config.max_sent_data),
-                ("max_recv_data", requested.max_recv_data(), config.max_recv_data),
+                (
+                    "max_sent_data",
+                    requested.max_sent_data(),
+                    config.max_sent_data,
+                ),
+                (
+                    "max_recv_data",
+                    requested.max_recv_data(),
+                    config.max_recv_data,
+                ),
             ];
             if let Some(&(what, requested, limit)) = limits.iter().find(|(_, r, l)| r > l) {
                 verifier
@@ -307,7 +315,9 @@ where
     let att_config = att_config.build().stage("attestation config")?;
 
     let CertBinding::V1_2(binding) = tls_transcript.certificate_binding() else {
-        return Err(NotaryError::Protocol("unsupported certificate binding".into()));
+        return Err(NotaryError::Protocol(
+            "unsupported certificate binding".into(),
+        ));
     };
     let transcript_length = TranscriptLength {
         sent: u32::try_from(sent_len).stage("sent length")?,

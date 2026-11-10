@@ -166,7 +166,12 @@ pub fn verify_claim_tracked(
         return Err(ClaimError::BodyMismatch);
     }
 
-    let count = data.repository.default_branch_ref.target.history.total_count;
+    let count = data
+        .repository
+        .default_branch_ref
+        .target
+        .history
+        .total_count;
     if count < input.threshold {
         return Err(ClaimError::BelowThreshold {
             count,
@@ -455,7 +460,13 @@ mod tests {
         assert!(matches!(err, ClaimError::BindingMismatch), "{err}");
         assert_eq!(
             record.0,
-            ["+deserialize", "-deserialize", "+verify", "-verify", "+http"]
+            [
+                "+deserialize",
+                "-deserialize",
+                "+verify",
+                "-verify",
+                "+http"
+            ]
         );
     }
 
