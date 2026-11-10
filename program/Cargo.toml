@@ -1,0 +1,54 @@
+[package]
+name = "orc-program"
+description = "SP1 guest: verifies an orc GitHub commit-count claim and commits abi.encode(PublicValues)"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Own workspace + Cargo.lock: the guest resolves with the sp1 patches below,
+# independently of the host workspace. Built by crates/orc-script/build.rs
+# (sp1-build), or by hand with `cargo prove build` in this directory.
+[workspace]
+
+[features]
+# =============================================================================
+# !!! TEST ONLY. NEVER DEPLOY, NEVER PUT ITS VKEY IN A CONTRACT. !!!
+#
+# `test-ca` swaps the hardcoded production trust anchors (Mozilla roots +
+# `api.github.com`) for tlsn's PUBLIC test CA and `test-server.io`, so that
+# presentations from the local e2e harness can be executed. The test CA's
+# private key is published in the tlsn repo: anyone can mint a certificate
+# for it and "prove" any response they like.
+#
+# It produces a DIFFERENT ELF and program vkey. Only the default (no-feature)
+# build is the production program.
+# =============================================================================
+test-ca = ["dep:tlsn-server-fixture-certs", "dep:tlsn-core"]
+
+[dependencies]
+sp1-zkvm = "6.10.0"
+orc-core = { path = "../crates/orc-core" }
+
+# Not used directly: enables alloy's `tiny-keccak` backend (feature
+# unification), so any keccak256 alloy computes goes through the patched
+# tiny-keccak below, i.e. the SP1 KECCAK_PERMUTE precompile, instead of the
+# software `sha3` crate. orc-core already hashes with tiny-keccak directly.
+alloy-primitives = { version = "1.7", default-features = false, features = ["tiny-keccak"] }
+
+# test-ca only.
+tlsn-core = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15", optional = true }
+tlsn-server-fixture-certs = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15", optional = true }
+
+# SP1 precompile patches (sp1 v6.10.0), same as spikes/m0a-sp1-verify. Check
+# they are the ones in use with `cargo tree -i sha2` etc. (the source must be
+# the sp1-patches git repo).
+[patch.crates-io]
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "patch-sha2-0.10.9-sp1-6.10.0" }
+k256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-k256-13.4-sp1-6.10.0" }
+p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p256-13.2-sp1-6.10.0" }
+tiny-keccak = { git = "https://github.com/sp1-patches/tiny-keccak", tag = "patch-2.0.2-sp1-6.10.0" }
+
+[profile.release]
+# Fewer cycles; build time is not a concern.
+codegen-units = 1
+lto = "fat"

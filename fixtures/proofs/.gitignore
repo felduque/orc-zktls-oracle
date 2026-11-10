@@ -1,0 +1,3 @@
+# Bincode proofs from `orc-script prove` (core/compressed ones are huge).
+# The JSON contract fixtures next to them are what gets committed.
+*.bin

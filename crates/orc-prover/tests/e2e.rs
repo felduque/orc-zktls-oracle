@@ -7,7 +7,10 @@
 
 mod harness;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use harness::{
     COMMITS, Framing, REPO_DB_ID, Reply, Run, Scenario, TOKEN, VIEWER_DB_ID, VIEWER_ID, find,
@@ -300,4 +303,62 @@ async fn notary_rejects_oversized_transcript_budget() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
     let chain = format!("{:?}", anyhow::Error::from(err));
     assert!(chain.contains("rejected"), "{chain}");
+}
+
+// ---- fixtures for the SP1 guest (M2) ------------------------------------------
+
+/// Writes harness presentations and guest inputs to `fixtures/test-ca/` for
+/// the test-ca SP1 guest (`orc-script execute --test-ca`):
+///
+/// - `content-length`, `chunked`, `close-delimited`: `<name>.bin` +
+///   `<name>.input.json`, each verified natively before it is written.
+/// - `neg-wrong-binding`, `neg-below-threshold`: `<name>.input.json` only;
+///   pair them with `content-length.bin`. Each is checked to fail natively
+///   with the expected error.
+///
+/// Ignored because it rewrites checked-in files (and `sessionTime` changes):
+/// `cargo test -p orc-prover --test e2e -- --ignored dump_test_ca_fixtures`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "rewrites fixtures/test-ca/; run explicitly"]
+async fn dump_test_ca_fixtures() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/test-ca");
+    std::fs::create_dir_all(&dir).expect("create fixtures/test-ca");
+    let write_input = |name: &str, input: &GuestInput| {
+        let json = serde_json::to_string_pretty(input).expect("input json") + "\n";
+        std::fs::write(dir.join(format!("{name}.input.json")), json).expect("write input");
+    };
+    let write_run = |name: &str, run: &Run| {
+        let pv = verify(run, &run.input).expect("positive fixture verifies natively");
+        assert_honest_public_values(run, &pv);
+        assert!(find(&run.outcome.presentation, TOKEN.as_bytes()).is_none());
+        std::fs::write(dir.join(format!("{name}.bin")), &run.outcome.presentation)
+            .expect("write presentation");
+        write_input(name, &run.input);
+    };
+
+    let content_length = honest().await;
+    write_run("content-length", content_length);
+    let chunked = run(Reply::ok(Framing::Chunked), Scenario::default()).await;
+    assert_eq!(chunked.outcome.response_framing, Some(http::Framing::Chunked));
+    write_run("chunked", &chunked);
+    let close = run(Reply::ok(Framing::CloseDelimited), Scenario::default()).await;
+    assert_eq!(close.outcome.response_framing, Some(http::Framing::CloseDelimited));
+    write_run("close-delimited", &close);
+
+    let wrong_binding = GuestInput {
+        eth_address: Address::repeat_byte(0x33),
+        ..content_length.input.clone()
+    };
+    assert_err!(verify(content_length, &wrong_binding), ClaimError::BindingMismatch);
+    write_input("neg-wrong-binding", &wrong_binding);
+
+    let below_threshold = GuestInput {
+        threshold: COMMITS + 1,
+        ..content_length.input.clone()
+    };
+    assert_err!(
+        verify(content_length, &below_threshold),
+        ClaimError::BelowThreshold { count: COMMITS, .. }
+    );
+    write_input("neg-below-threshold", &below_threshold);
 }

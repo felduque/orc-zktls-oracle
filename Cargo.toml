@@ -4,12 +4,13 @@
 # - crates/orc-notary  TCP notary (tlsn Verifier + k256 attestation signer)
 # - crates/orc-prover  `orc` CLI: preflight, MPC-TLS to api.github.com, presentation
 #
-# `program/` (SP1 guest) has its own workspace and lockfile; the spikes are
-# standalone and frozen.
+# `program/` (SP1 guest) and `crates/orc-script` (SP1 host) have their own
+# workspaces and lockfiles, so `cargo test --workspace` here never compiles
+# sp1-sdk or the guest; the spikes are standalone and frozen.
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["program", "spikes"]
+exclude = ["program", "spikes", "crates/orc-script"]
 
 [workspace.package]
 version = "0.1.0"

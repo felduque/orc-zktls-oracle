@@ -28,8 +28,8 @@ pub use error::ClaimError;
 pub use graphql::{GRAPHQL_QUERY, graphql_body};
 pub use input::GuestInput;
 pub use verify::{
-    DEFAULT_MAX_AUTH_VALUE_LEN, GITHUB_API_HOST, MAX_PRESENTATION_BYTES, VerifyParams,
-    verify_claim,
+    DEFAULT_MAX_AUTH_VALUE_LEN, GITHUB_API_HOST, MAX_PRESENTATION_BYTES, NoTracker, Tracker,
+    VerifyParams, phase, verify_claim, verify_claim_tracked,
 };
 
 /// Re-exported so callers can build [`GuestInput`] without a direct alloy dependency.

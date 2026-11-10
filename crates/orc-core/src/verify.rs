@@ -16,6 +16,10 @@
 //! 8. Request body is byte-identical to `graphql_body(owner, name, viewer.id)`,
 //!    so the commit count is the authenticated viewer's.
 //! 9. `totalCount >= threshold`.
+//!
+//! [`verify_claim_tracked`] reports these steps as phases to a [`Tracker`]
+//! (the SP1 guest turns them into cycle-tracker markers); [`verify_claim`]
+//! is the same function with a no-op tracker.
 
 use alloy_primitives::B256;
 use bincode::Options;
@@ -96,6 +100,35 @@ impl VerifyParams {
     }
 }
 
+/// Phase labels reported by [`verify_claim_tracked`], in order.
+pub mod phase {
+    /// Step 1: bounded bincode decode of the presentation.
+    pub const DESERIALIZE: &str = "deserialize";
+    /// Steps 2-3: notary key checks and the full `Presentation::verify`
+    /// (attestation signature, server certificate chain, transcript openings).
+    pub const VERIFY: &str = "verify";
+    /// Steps 4-6: redaction rule, HTTP request/response parsing, request shape.
+    pub const HTTP: &str = "http";
+    /// Steps 7-9: strict GraphQL JSON parse, body/threshold checks, nullifier.
+    pub const JSON: &str = "json";
+}
+
+/// Receives phase boundaries from [`verify_claim_tracked`]. Every `start`
+/// is matched by an `end` with the same label unless the phase fails.
+pub trait Tracker {
+    fn start(&mut self, label: &'static str);
+    fn end(&mut self, label: &'static str);
+}
+
+/// A [`Tracker`] that does nothing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoTracker;
+
+impl Tracker for NoTracker {
+    fn start(&mut self, _label: &'static str) {}
+    fn end(&mut self, _label: &'static str) {}
+}
+
 /// Verifies a bincode-encoded TLSNotary presentation against the claim in
 /// `input` and returns the values to commit on-chain.
 ///
@@ -106,9 +139,24 @@ pub fn verify_claim(
     input: &GuestInput,
     params: &VerifyParams,
 ) -> Result<PublicValues, ClaimError> {
-    let session = verify_session(presentation, params)?;
+    verify_claim_tracked(presentation, input, params, &mut NoTracker)
+}
+
+/// [`verify_claim`], reporting the [`phase`]s to `tracker`.
+pub fn verify_claim_tracked(
+    presentation: &[u8],
+    input: &GuestInput,
+    params: &VerifyParams,
+    tracker: &mut impl Tracker,
+) -> Result<PublicValues, ClaimError> {
+    let session = verify_session(presentation, params, tracker)?;
+
+    tracker.start(phase::HTTP);
     let exchange = check_transcript(session.transcript, params)?;
     check_request(&exchange.request, input, params)?;
+    tracker.end(phase::HTTP);
+
+    tracker.start(phase::JSON);
     let data = check_response(&exchange.response)?;
 
     // The query variable `$a` must be the authenticated viewer, otherwise the
@@ -126,7 +174,7 @@ pub fn verify_claim(
         });
     }
 
-    Ok(PublicValues {
+    let public_values = PublicValues {
         ethAddress: input.eth_address,
         chainId: input.chain_id,
         campaignId: input.campaign_id,
@@ -135,7 +183,9 @@ pub fn verify_claim(
         notaryKeyHash: session.notary_key_hash,
         sessionTime: session.session_time,
         nullifier: nullifier(data.viewer.database_id, input.campaign_id),
-    })
+    };
+    tracker.end(phase::JSON);
+    Ok(public_values)
 }
 
 /// Output of steps 1-3.
@@ -168,8 +218,16 @@ fn decode_presentation(bytes: &[u8]) -> Result<Presentation, ClaimError> {
         .map_err(|e| ClaimError::Decode(e.to_string()))
 }
 
-fn verify_session(bytes: &[u8], params: &VerifyParams) -> Result<VerifiedSession, ClaimError> {
+fn verify_session(
+    bytes: &[u8],
+    params: &VerifyParams,
+    tracker: &mut impl Tracker,
+) -> Result<VerifiedSession, ClaimError> {
+    tracker.start(phase::DESERIALIZE);
     let presentation = decode_presentation(bytes)?;
+    tracker.end(phase::DESERIALIZE);
+
+    tracker.start(phase::VERIFY);
 
     let key = presentation.verifying_key();
     if key.alg != KeyAlgId::K256 {
@@ -211,11 +269,13 @@ fn verify_session(bytes: &[u8], params: &VerifyParams) -> Result<VerifiedSession
         });
     }
 
-    Ok(VerifiedSession {
+    let session = VerifiedSession {
         notary_key_hash,
         session_time: connection_info.time,
         transcript: transcript.ok_or(ClaimError::MissingTranscript)?,
-    })
+    };
+    tracker.end(phase::VERIFY);
+    Ok(session)
 }
 
 fn check_transcript(
@@ -356,7 +416,7 @@ mod tests {
         let bytes = std::fs::read(fixture("m0b-github-graphql-401.bin")).expect("fixture");
         let params = VerifyParams::github();
 
-        let session = verify_session(&bytes, &params).expect("verify session");
+        let session = verify_session(&bytes, &params, &mut NoTracker).expect("verify session");
         // M0b notary dummy key [1u8; 32].
         let key = hex::decode("031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f")
             .expect("hex");
@@ -373,6 +433,30 @@ mod tests {
         // The spike sent `x-orc-binding: 0xdeadbeef`, so the claim fails there.
         let err = verify_claim(&bytes, &any_input(), &params).expect_err("must fail");
         assert!(matches!(err, ClaimError::BindingMismatch), "{err}");
+    }
+
+    /// Phases are reported in order; a failing phase is started but not ended.
+    #[test]
+    fn tracker_sees_phases_in_order() {
+        struct Record(Vec<String>);
+        impl Tracker for Record {
+            fn start(&mut self, label: &'static str) {
+                self.0.push(format!("+{label}"));
+            }
+            fn end(&mut self, label: &'static str) {
+                self.0.push(format!("-{label}"));
+            }
+        }
+
+        let bytes = std::fs::read(fixture("m0b-github-graphql-401.bin")).expect("fixture");
+        let mut record = Record(Vec::new());
+        let err = verify_claim_tracked(&bytes, &any_input(), &VerifyParams::github(), &mut record)
+            .expect_err("must fail");
+        assert!(matches!(err, ClaimError::BindingMismatch), "{err}");
+        assert_eq!(
+            record.0,
+            ["+deserialize", "-deserialize", "+verify", "-verify", "+http"]
+        );
     }
 
     #[test]

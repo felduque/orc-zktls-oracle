@@ -1,0 +1,46 @@
+[package]
+name = "orc-script"
+description = "SP1 host for the orc guest: execute, vkey, prove, contract fixtures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "orc-script"
+
+# Own workspace + Cargo.lock (like program/ and the spikes), excluded from the
+# root workspace. `cargo test --workspace` at the root ignores
+# `default-members`, so membership alone would make every root test run
+# compile sp1-sdk and build both guest ELFs, and it would merge sp1-sdk's
+# dependency graph into the root Cargo.lock that tlsn/MPC resolve against.
+#
+# Run it inside the dev container from this directory:
+#   cargo run --release -- execute --presentation <file> --input <json> [--test-ca]
+#   cargo run --release --features profiling -- execute ...   (per-phase cycles)
+[workspace]
+
+[dependencies]
+sp1-sdk = { version = "6.10.0", features = ["blocking", "native-gnark"] }
+orc-core = { path = "../orc-core" }
+# Native mirror of the guest's `test-ca` trust anchors (see program/Cargo.toml).
+tlsn-core = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
+tlsn-server-fixture-certs = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15" }
+
+anyhow = "1.0"
+bincode = "1.3"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Only for the guest stderr channel of sp1-sdk's execute request.
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+# SP1 v6 only honours `cycle-tracker-report-*` guest markers with sp1-sdk's
+# `profiling` feature (sp1-core-executor src/minimal/write.rs).
+# Safe to toggle in a shared target dir ONLY because the dev image sets
+# SP1_CORE_RUNNER_OVERRIDE_BINARY (see docker/Dockerfile). Without it, a
+# `profiling` build overwrites the native runner binary with a stub and breaks
+# default builds ("failed sending input to child: Broken pipe").
+profiling = ["sp1-sdk/profiling"]
+
+[build-dependencies]
+sp1-build = "6.10.0"
