@@ -3,3 +3,9 @@ target/
 .env
 # Secrets files contain the raw prover token by design. Never commit them.
 spikes/**/fixtures/secrets-*.bin
+
+# Foundry outputs (contracts/). Local anvil broadcasts are throwaway.
+contracts/out/
+contracts/cache/
+contracts/broadcast/*/31337/
+contracts/broadcast/**/dry-run/

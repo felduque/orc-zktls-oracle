@@ -1,0 +1,30 @@
+# Foundry project for the orc zk-TLS PoC (milestones M3-M5).
+# Run everything through the dev container, from the repo root:
+#   docker compose run --rm -T dev bash -c 'cd contracts && forge test -vv'
+
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+
+# Same compiler as sp1-contracts v6.1.1 (its foundry.toml pins 0.8.20), so the
+# real SP1VerifierGroth16 v6.1.0 compiles in the same build for M4.
+solc = "0.8.20"
+evm_version = "shanghai"
+optimizer = true
+optimizer_runs = 200
+
+# Treat compiler warnings as errors: `forge build` must stay warning-free.
+deny = "warnings"
+
+# OrcClaimTest reads the cross-agent fixture written by the SP1 host (M2).
+fs_permissions = [{ access = "read", path = "./fixtures" }]
+
+[fuzz]
+runs = 1024
+
+[fmt]
+line_length = 100
+tab_width = 4
