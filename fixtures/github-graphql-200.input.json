@@ -1,0 +1,8 @@
+{
+  "eth_address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+  "chain_id": 84532,
+  "campaign_id": "0xad9658d77497a2be2118b3b2bb1a1ab3718565faa76cc253ce3f84c0b0e0d5fc",
+  "owner": "felduque",
+  "name": "orc-zktls-oracle",
+  "threshold": 5
+}
