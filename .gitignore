@@ -9,3 +9,6 @@ contracts/out/
 contracts/cache/
 contracts/broadcast/*/31337/
 contracts/broadcast/**/dry-run/
+# GitHub's unauthenticated rate-limit 403 embeds the client's public IP in the
+# body, and these presentations reveal the full response. Never publish them.
+spikes/m0b-mpc-github/fixtures/*-graphql-noauth.bin
