@@ -4,6 +4,7 @@ description = "Guest-safe verification of an orc GitHub commit-count claim from 
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # Compiled into the SP1 guest (riscv64im-succinct-zkvm-elf) in M2.
 # Keep this list free of tokio, hyper, networking and anything std-OS specific.

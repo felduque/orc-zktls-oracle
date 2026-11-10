@@ -4,6 +4,7 @@ description = "SP1 host for the orc guest: execute, vkey, prove, contract fixtur
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 default-run = "orc-script"
 
 # Own workspace + Cargo.lock (like program/ and the spikes), excluded from the

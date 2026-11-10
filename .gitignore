@@ -12,3 +12,7 @@ contracts/broadcast/**/dry-run/
 # GitHub's unauthenticated rate-limit 403 embeds the client's public IP in the
 # body, and these presentations reveal the full response. Never publish them.
 spikes/m0b-mpc-github/fixtures/*-graphql-noauth.bin
+
+# `orc prove --out-dir out/...` (README). A presentation reveals the full GitHub
+# response (login, ids, commit count): personal data, never commit it.
+/out/

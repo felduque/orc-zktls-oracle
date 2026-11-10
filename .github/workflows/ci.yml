@@ -1,0 +1,77 @@
+# CI for the orc zk-TLS PoC.
+#
+# Deliberately NOT built here: the SP1 guest (program/) and its host
+# (crates/orc-script). They need the SP1 toolchain, the riscv64 C toolchain,
+# protoc + libprotobuf-dev and several GB of build artifacts; that is too heavy
+# for CI runners. Build and check them in the Docker dev env (see README), and
+# compare `orc-script vkey` against the documented production vkey.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: cargo test (root workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # No submodules: they only hold Solidity libraries (contracts/lib).
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Same Rust as the dev image (docker/Dockerfile, rust:1.99.1-trixie).
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No system packages needed: the root workspace's only native build
+      # dependency is ring (C, built with the runner's cc). protoc and
+      # libprotobuf-dev are only needed by sp1-sdk, i.e. crates/orc-script,
+      # which is a separate workspace. Verified in a clean rust:1.99.1-trixie
+      # container without protoc or clang, capped at 4 CPUs / 16 GB.
+      #
+      # The e2e tests run real MPC-TLS sessions between the prover and the
+      # notary against a local TLS server with tlsn's test CA. They are
+      # offline and need no secrets. The real-GitHub fixture test skips itself
+      # when fixtures/github-graphql-200.bin is absent.
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+  contracts:
+    name: forge build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # Same Foundry as the dev image (docker/Dockerfile FOUNDRY_VERSION).
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.8.7
+
+      - name: forge build
+        run: forge build
+
+      - name: forge test
+        run: forge test -vv

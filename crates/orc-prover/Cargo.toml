@@ -4,6 +4,7 @@ description = "orc prover: MPC-TLS to api.github.com with a notary, producing a 
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 name = "orc_prover"

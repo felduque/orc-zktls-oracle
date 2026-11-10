@@ -4,6 +4,7 @@ description = "SP1 guest: verifies an orc GitHub commit-count claim and commits 
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 
 # Own workspace + Cargo.lock: the guest resolves with the sp1 patches below,
 # independently of the host workspace. Built by crates/orc-script/build.rs

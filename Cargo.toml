@@ -16,6 +16,7 @@ exclude = ["program", "spikes", "crates/orc-script"]
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # TLSNotary: pinned git tag (not on crates.io). Same crates/features as spike m0b,
