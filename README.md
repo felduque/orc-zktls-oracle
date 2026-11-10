@@ -29,6 +29,7 @@ case itself is not new (see [Prior art](#prior-art-and-credits)).
 - [Measured numbers](#measured-numbers)
 - [Milestones](#milestones)
 - [Security review](#security-review)
+- [Known issues](#known-issues)
 - [Known limitations and future work](#known-limitations-and-future-work)
 - [Reproducibility](#reproducibility)
 - [Prior art and credits](#prior-art-and-credits)
@@ -577,6 +578,21 @@ An independent adversarial review of `48c038b` found no critical issues. Status 
 | L4 | The real 200 fixture reveals response metadata (token expiry, request id, edge region). | **Accepted**: it is the maintainer's own public data, audited for token bytes, IPs and emails before committing. |
 | Info | `sessionTime` is the prover's clock (notary-checked to ±5 s); the notary signs prover extensions without a validator; SNI is not committed; the hidden length reveals the token type. | **Accepted / documented**: the length now always says "fine-grained PAT", which the visible prefix says anyway. |
 
+## Known issues
+
+**Intermittent MPC setup stall (tlsn alpha.15).** An MPC-TLS session sometimes stops making
+progress in setup: both sides sit idle in mpc-tls preprocessing (`prover:commit:preprocess`,
+`verifier:accept:preprocess`) with nothing left in flight on the multiplexer, until the phase
+timeout. It is rare on many cores but hits about 1 in 3 sessions on 4 CPUs (reproduce with
+`ORC_TEST_MPC_SLOTS=1 taskset -c 0-3 cargo test -p orc-prover --test e2e -- --test-threads=1`);
+the root cause is not isolated yet. Mitigations: every MPC phase has a timeout and the `orc` CLI
+retries once with a fresh notary session; the e2e harness retries timed-out sessions (3 x 45 s by
+default; CI runs the suite serialized with 8 x 15 s, see the `ORC_TEST_*` variables in
+[ci.yml](.github/workflows/ci.yml)). For every failed attempt the harness prints the tail of the
+prover's and the notary's tracing logs and the spans that sat idle
+([`harness/logs.rs`](crates/orc-prover/tests/harness/logs.rs)); CI uploads the full logs as the
+`orc-e2e-mpc-diagnostics` artifact.
+
 ## Known limitations and future work
 
 - **Single trusted notary.** Decentralizing it is the next design phase: k-of-n notaries, a
@@ -600,8 +616,7 @@ An independent adversarial review of `48c038b` found no critical issues. Status 
 - **One data source.** The query, server and trust anchors are hardcoded for GitHub GraphQL.
   "Commits" means default-branch commits that GitHub attributes to the account
   (`history(author: {id})`).
-- **MPC flakiness.** A rare "MPC setup timed out" (about 2 in 150 local sessions). Each MPC
-  phase has a timeout and the prover retries once.
+- **MPC setup stall.** See [Known issues](#known-issues).
 - **tlsn is alpha** and has breaking changes between tags. Everything is pinned (see below).
 
 ## Reproducibility
@@ -621,8 +636,9 @@ lockfile would silently change the vkey, and tlsn alpha tags break APIs. Bump by
 `vkey`, and redeploy.
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo fmt --check`,
-`cargo clippy -D warnings` and `cargo test --workspace --locked`, and `forge fmt --check`,
-`forge build` + `forge test`. It does not build the SP1 guest (too heavy for CI runners).
+`cargo clippy -D warnings` and `cargo test --locked` (the MPC e2e suite in its own, serialized
+step; see [Known issues](#known-issues)), and `forge fmt --check`, `forge build` + `forge test`.
+It does not build the SP1 guest (too heavy for CI runners).
 
 ### Fixtures
 

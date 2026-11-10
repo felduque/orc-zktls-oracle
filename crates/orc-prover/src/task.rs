@@ -5,14 +5,20 @@ use std::{
 };
 
 use tokio::task::{JoinError, JoinHandle};
+use tracing::{Instrument, instrument::WithSubscriber};
 
 /// A spawned task that is aborted when dropped, so a failed or timed-out
 /// session attempt leaves nothing running before the retry.
 pub(crate) struct AbortOnDrop<T>(JoinHandle<T>);
 
 impl<T: Send + 'static> AbortOnDrop<T> {
+    /// Spawns `fut` in the current span and with the current tracing
+    /// dispatcher, so its events (e.g. the session driver's) are logged with
+    /// the session that spawned it.
     pub(crate) fn spawn(fut: impl Future<Output = T> + Send + 'static) -> Self {
-        Self(tokio::spawn(fut))
+        Self(tokio::spawn(
+            fut.in_current_span().with_current_subscriber(),
+        ))
     }
 }
 

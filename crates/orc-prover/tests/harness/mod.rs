@@ -2,10 +2,17 @@
 //! tlsn's test CA (`test-server.io`, valid until 2124) that answers the
 //! preflight and serves one canned GraphQL reply per scenario, with
 //! selectable HTTP framing. The real orc notary runs on another local port.
+//!
+//! Each scenario holds one of [`MPC_SLOTS`], runs up to
+//! [`Scenario::attempts`] fresh notary sessions, retrying only a phase
+//! timeout (tlsn's MPC setup stall, see `logs`), and prints the prover's and
+//! the notary's log tails for every attempt that failed.
+
+mod logs;
 
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -26,11 +33,14 @@ use tlsn::{
 use tlsn_server_fixture_certs::{CA_CERT_DER, SERVER_CERT_DER, SERVER_DOMAIN, SERVER_KEY_DER};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::Semaphore,
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_rustls::TlsAcceptor;
+use tracing::{Dispatch, instrument::WithSubscriber};
+
+use self::logs::SessionLogs;
 
 pub const VIEWER_ID: &str = "U_kgDOorcTest";
 pub const VIEWER_CREATED_AT: &str = "2015-06-01T12:34:56Z";
@@ -41,9 +51,24 @@ pub const REPO_DB_ID: u64 = 1_300_192;
 pub const COMMITS: u64 = 42;
 pub const NOTARY_SECRET: [u8; 32] = [7u8; 32];
 
-/// Each MPC session needs a few hundred MB and several cores; cap how many
-/// tests run one at the same time.
-static MPC_SLOTS: Semaphore = Semaphore::const_new(2);
+/// Concurrent MPC sessions across the test binary (default 2). Each needs a
+/// few hundred MB and several cores. CI sets 1.
+pub const MPC_SLOTS_ENV: &str = "ORC_TEST_MPC_SLOTS";
+/// Overrides [`DEFAULT_ATTEMPTS`] (CI raises it, see ci.yml).
+pub const ATTEMPTS_ENV: &str = "ORC_TEST_ATTEMPTS";
+/// Overrides [`DEFAULT_PHASE_TIMEOUT`], in seconds (CI lowers it).
+pub const PHASE_TIMEOUT_ENV: &str = "ORC_TEST_PHASE_TIMEOUT_SECS";
+
+/// A positive integer from the environment, if set.
+fn env_count(name: &str) -> Option<u32> {
+    let value = std::env::var(name).ok()?;
+    let count = value.trim().parse::<u32>().ok().filter(|&n| n > 0);
+    Some(count.unwrap_or_else(|| panic!("{name}={value:?}: expected a positive integer")))
+}
+
+/// Caps how many tests run an MPC session at the same time.
+static MPC_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(env_count(MPC_SLOTS_ENV).unwrap_or(2) as usize));
 
 /// A fake fine-grained PAT (`github_pat_` + 22 + `_` + 59 characters, the
 /// real shape). Built at run time so the repository holds no token-shaped
@@ -301,22 +326,88 @@ impl Drop for TestNotary {
     }
 }
 
-pub async fn spawn_notary(key: NotaryKey) -> TestNotary {
+/// A notary with production limits (10 s setup deadline, 2 sessions per
+/// source address: every harness connection comes from 127.0.0.1) and a
+/// 120 s session timeout, logging to `logs`.
+pub async fn spawn_notary(key: NotaryKey, logs: Dispatch) -> TestNotary {
     let key_hash = key.key_hash();
     let mut config = NotaryConfig::new(key);
     config.root_store = test_roots();
     config.session_timeout = Duration::from_secs(120);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind notary");
     let addr = listener.local_addr().expect("notary addr");
-    let task = tokio::spawn(async move {
-        if let Err(e) = orc_notary::serve(listener, Arc::new(config)).await {
-            eprintln!("notary stopped: {e}");
+    let task = tokio::spawn(
+        async move {
+            if let Err(e) = orc_notary::serve(listener, Arc::new(config)).await {
+                eprintln!("notary stopped: {e}");
+            }
         }
-    });
+        .with_subscriber(logs),
+    );
     TestNotary {
         addr,
         key_hash,
         task,
+    }
+}
+
+// ---- simulated hang ---------------------------------------------------------
+
+/// A TCP relay in front of the notary. It forwards both ways, except on its
+/// first `stall` connections: there it forwards the prover's bytes but
+/// swallows every byte the notary sends, so the prover waits in MPC setup
+/// for a reply that never comes, with idle CPU, like tlsn's real stall. Once
+/// the prover gives up and closes, the relay closes the notary side too.
+pub struct StallProxy {
+    pub addr: SocketAddr,
+    task: JoinHandle<()>,
+}
+
+impl Drop for StallProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn spawn_stall_proxy(notary: SocketAddr, stall: u32) -> StallProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let task = tokio::spawn(async move {
+        // Owned here, so aborting the proxy aborts every relay.
+        let mut relays = JoinSet::new();
+        let mut accepted = 0u32;
+        loop {
+            let Ok((prover, _)) = listener.accept().await else {
+                continue;
+            };
+            while relays.try_join_next().is_some() {}
+            relays.spawn(relay(prover, notary, accepted < stall));
+            accepted = accepted.saturating_add(1);
+        }
+    });
+    StallProxy { addr, task }
+}
+
+async fn relay(mut prover: TcpStream, notary: SocketAddr, stall: bool) {
+    let Ok(mut notary) = TcpStream::connect(notary).await else {
+        return;
+    };
+    let _ = prover.set_nodelay(true);
+    let _ = notary.set_nodelay(true);
+    if !stall {
+        let _ = tokio::io::copy_bidirectional(&mut prover, &mut notary).await;
+        return;
+    }
+    let (mut from_prover, _to_prover) = prover.split();
+    let (mut from_notary, mut to_notary) = notary.split();
+    let swallow = async {
+        let _ = tokio::io::copy(&mut from_notary, &mut tokio::io::sink()).await;
+        // Even if the notary hangs up, the prover must not hear about it.
+        std::future::pending::<()>().await
+    };
+    tokio::select! {
+        _ = tokio::io::copy(&mut from_prover, &mut to_notary) => {}
+        () = swallow => {}
     }
 }
 
@@ -334,13 +425,23 @@ pub fn input() -> GuestInput {
     }
 }
 
-/// Default session attempts: like production (`ProverOptions::default`), one
-/// retry after a hang or transport failure.
-pub const DEFAULT_ATTEMPTS: u32 = 2;
-/// Default deadline per MPC phase. Production uses 120 s; local phases take
-/// ~1 s, but a slow shared CI runner running two sessions at once can take
-/// far longer than the old 20 s (CI run 42841217389).
-pub const DEFAULT_PHASE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default session attempts ([`ATTEMPTS_ENV`]). Only a phase timeout is
+/// retried: tlsn's MPC setup stall (README, "Known issues") hit both of 2
+/// attempts in CI run 42850036536.
+pub const DEFAULT_ATTEMPTS: u32 = 3;
+/// Default deadline per MPC phase ([`PHASE_TIMEOUT_ENV`]; production: 120 s).
+/// A healthy phase takes at most ~1.4 s even on 4 CPUs; a stalled session
+/// sits idle and never recovers, so waiting longer only delays the retry.
+pub const DEFAULT_PHASE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Session attempts of a scenario that does not set them: [`ATTEMPTS_ENV`]
+/// or [`DEFAULT_ATTEMPTS`].
+pub fn default_attempts() -> u32 {
+    env_count(ATTEMPTS_ENV).unwrap_or(DEFAULT_ATTEMPTS)
+}
+
+/// Wait after a timed-out attempt before reporting it (the notary ends a
+/// session ~1 ms after the prover's connection closes).
+const NOTARY_GRACE: Duration = Duration::from_millis(500);
 
 /// How a scenario deviates from the honest flow.
 #[derive(Default)]
@@ -352,41 +453,81 @@ pub struct Scenario {
     pub p256_notary: bool,
     /// Ask the notary for this MPC response budget.
     pub max_recv_data: Option<usize>,
-    /// Session attempts (default [`DEFAULT_ATTEMPTS`]).
+    /// Session attempts (default [`ATTEMPTS_ENV`] or [`DEFAULT_ATTEMPTS`]).
     pub attempts: Option<u32>,
-    /// Prover deadline per session phase (default [`DEFAULT_PHASE_TIMEOUT`]).
+    /// Prover deadline per session phase (default [`PHASE_TIMEOUT_ENV`] or
+    /// [`DEFAULT_PHASE_TIMEOUT`]).
     pub phase_timeout: Option<Duration>,
+    /// Simulated hang: the notary's first `stall_sessions` sessions never
+    /// answer the prover (see [`StallProxy`]).
+    pub stall_sessions: u32,
+    /// Attempts fail on purpose: keep their diagnostics off the real stderr
+    /// and out of `ORC_TEST_LOG_DIR` (they are still in [`Report::failures`]).
+    pub expect_failures: bool,
 }
 
 pub struct Run {
     pub outcome: ProveOutcome,
     pub input: GuestInput,
     pub notary_key_hash: B256,
+    /// Session attempts used (fresh notary session each).
+    pub attempts: u32,
 }
 
 /// Runs preflight + MPC-TLS + attestation + presentation against a local
 /// server serving `reply`, with a fresh local notary.
 pub async fn run(reply: Reply, scenario: Scenario) -> Result<Run, ProverError> {
-    run_timed(reply, scenario).await.0
+    run_report(reply, scenario).await.result
 }
 
-/// [`run`], plus how long the scenario took once it held an MPC slot: time
-/// spent queueing behind other tests' sessions is not counted.
-pub async fn run_timed(reply: Reply, scenario: Scenario) -> (Result<Run, ProverError>, Duration) {
+pub struct Report {
+    pub result: Result<Run, ProverError>,
+    /// How long the scenario took once it held an MPC slot: time spent
+    /// queueing behind other tests' sessions is not counted.
+    pub elapsed: Duration,
+    /// Diagnostics (log tails) of each failed attempt, oldest first.
+    pub failures: Vec<String>,
+}
+
+/// [`run`], with timing and the diagnostics of failed attempts.
+pub async fn run_report(reply: Reply, scenario: Scenario) -> Report {
+    // libtest names each test's thread after the test; `#[tokio::test]`
+    // polls the test body (and so this) on it.
+    let test = std::thread::current()
+        .name()
+        .filter(|name| *name != "main")
+        .unwrap_or("e2e")
+        .to_owned();
     let _slot = MPC_SLOTS.acquire().await.expect("semaphore");
     let started = Instant::now();
-    let result = run_session(reply, scenario).await;
-    (result, started.elapsed())
+    let mut failures = Vec::new();
+    let result = run_session(&test, reply, scenario, &mut failures).await;
+    Report {
+        result,
+        elapsed: started.elapsed(),
+        failures,
+    }
 }
 
-async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverError> {
+async fn run_session(
+    test: &str,
+    reply: Reply,
+    scenario: Scenario,
+    failures: &mut Vec<String>,
+) -> Result<Run, ProverError> {
+    let mut logs = SessionLogs::new(test);
     let server = spawn_server(reply).await;
     let key = if scenario.p256_notary {
         NotaryKey::secp256r1(NOTARY_SECRET).expect("p256 key")
     } else {
         NotaryKey::secp256k1(NOTARY_SECRET).expect("k256 key")
     };
-    let notary = spawn_notary(key).await;
+    let notary = spawn_notary(key, logs.notary_dispatch()).await;
+    let proxy = match scenario.stall_sessions {
+        0 => None,
+        stall => Some(spawn_stall_proxy(notary.addr, stall).await),
+    };
+    let notary_addr = proxy.as_ref().map_or(notary.addr, |p| p.addr).to_string();
 
     let target = Target {
         server_name: SERVER_DOMAIN.to_owned(),
@@ -394,10 +535,14 @@ async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverErro
         root_store: test_roots(),
     };
     let token = GithubToken::new(token()).expect("token");
+    let phase_timeout = env_count(PHASE_TIMEOUT_ENV).map(|secs| Duration::from_secs(secs.into()));
     let mut opts = ProverOptions {
-        // A hang (see spike m0b) is cut at the phase timeout and retried once.
-        phase_timeout: scenario.phase_timeout.unwrap_or(DEFAULT_PHASE_TIMEOUT),
-        attempts: scenario.attempts.unwrap_or(DEFAULT_ATTEMPTS),
+        phase_timeout: scenario
+            .phase_timeout
+            .or(phase_timeout)
+            .unwrap_or(DEFAULT_PHASE_TIMEOUT),
+        // The attempts are run below, so each can be diagnosed.
+        attempts: 1,
         disclosure: scenario.disclosure,
         ..ProverOptions::default()
     };
@@ -416,23 +561,51 @@ async fn run_session(reply: Reply, scenario: Scenario) -> Result<Run, ProverErro
     let viewer = scenario.viewer_override.unwrap_or(viewer);
 
     let input = input();
-    let outcome = prove(
-        &notary.addr.to_string(),
-        &target,
-        &token,
-        &input,
-        &viewer,
-        &opts,
-    )
-    .await?;
-    for reason in &outcome.retry_reasons {
-        eprintln!("note: MPC session retried after: {reason}");
+    let attempts = scenario.attempts.unwrap_or_else(default_attempts).max(1);
+    let prover_logs = logs.prover_dispatch();
+    let mut attempt = 1;
+    loop {
+        logs.attempt_started(attempt, attempts);
+        // A fresh notary connection and tlsn session. A timed-out attempt
+        // leaves nothing running: its session driver and MPC tasks are
+        // aborted when `prove` returns, and the notary ends its side when the
+        // connection closes.
+        let result = prove(&notary_addr, &target, &token, &input, &viewer, &opts)
+            .with_subscriber(prover_logs.clone())
+            .await;
+        match result {
+            Ok(outcome) => {
+                return Ok(Run {
+                    outcome,
+                    input,
+                    notary_key_hash: notary.key_hash,
+                    attempts: attempt,
+                });
+            }
+            Err(e) => {
+                let failed_at = Instant::now();
+                let timed_out = matches!(e, ProverError::Timeout { .. });
+                if timed_out {
+                    // Let the notary notice the closed connection and log
+                    // how its side of the stalled session ended.
+                    tokio::time::sleep(NOTARY_GRACE).await;
+                }
+                // Only the known stall is retried; anything else is a real
+                // failure (or the outcome the test expects).
+                let retry = timed_out && attempt < attempts;
+                let report =
+                    logs.report(attempt, attempts, &e, retry, timed_out.then_some(failed_at));
+                if !scenario.expect_failures {
+                    logs.publish(attempt, &report);
+                }
+                failures.push(report);
+                if !retry {
+                    return Err(e);
+                }
+                attempt += 1;
+            }
+        }
     }
-    Ok(Run {
-        outcome,
-        input,
-        notary_key_hash: notary.key_hash,
-    })
 }
 
 /// Index of the first occurrence of `needle`.

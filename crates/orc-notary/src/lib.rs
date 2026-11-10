@@ -39,7 +39,7 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, instrument::WithSubscriber, warn};
 
 use tlsn::{
     Session, SessionHandle,
@@ -367,7 +367,7 @@ where
     let started = Instant::now();
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
-    let mut driver_task: DriverTask<S> = AbortOnDrop(tokio::spawn(driver));
+    let mut driver_task: DriverTask<S> = AbortOnDrop::spawn(driver);
 
     let verifier_config = VerifierConfig::builder()
         .root_store(config.root_store.clone())
@@ -531,20 +531,26 @@ pub async fn serve(listener: TcpListener, config: Arc<NotaryConfig>) -> Result<(
             debug!(%peer, error = %e, "set_nodelay failed");
         }
         let config = config.clone();
-        tokio::spawn(async move {
+        // The session's (and tlsn's) events carry the peer and go to the
+        // dispatcher `serve` runs under.
+        let session = async move {
             let _permit = permit;
-            info!(%peer, "session started");
+            info!("session started");
             match notarize(socket, &config).await {
                 Ok(s) => info!(
-                    %peer,
                     sent = s.sent_len,
                     recv = s.recv_len,
                     elapsed_ms = s.elapsed.as_millis() as u64,
                     "attestation signed"
                 ),
-                Err(e) => warn!(%peer, error = %e, "session failed"),
+                Err(e) => warn!(error = %e, "session failed"),
             }
-        });
+        };
+        tokio::spawn(
+            session
+                .instrument(info_span!("session", %peer))
+                .with_current_subscriber(),
+        );
     }
 }
 
@@ -607,6 +613,16 @@ fn application_data_len(records: &[Record]) -> usize {
 /// A spawned task that is aborted if the session future is dropped early
 /// (timeout, error), so nothing keeps running in the background.
 struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T: Send + 'static> AbortOnDrop<T> {
+    /// Spawns `fut` in the current span and with the current tracing
+    /// dispatcher (see `serve`).
+    fn spawn(fut: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(tokio::spawn(
+            fut.in_current_span().with_current_subscriber(),
+        ))
+    }
+}
 
 impl<T> Future for AbortOnDrop<T> {
     type Output = Result<T, JoinError>;

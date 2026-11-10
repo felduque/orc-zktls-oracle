@@ -39,3 +39,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 orc-notary.workspace = true
 tlsn-server-fixture-certs.workspace = true
+# The e2e harness turns tlsn-mux's `log` records into tracing events.
+tracing-log.workspace = true

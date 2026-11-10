@@ -358,10 +358,12 @@ async fn notary_rejects_oversized_transcript_budget() {
         max_recv_data: Some(2 * orc_notary::DEFAULT_MAX_RECV_DATA),
         attempts: Some(1),
         phase_timeout: Some(phase_timeout),
+        expect_failures: true,
         ..Scenario::default()
     };
-    let (result, elapsed) = harness::run_timed(Reply::ok(Framing::ContentLength), scenario).await;
-    let Err(err) = result else {
+    let report = harness::run_report(Reply::ok(Framing::ContentLength), scenario).await;
+    let elapsed = report.elapsed;
+    let Err(err) = report.result else {
         panic!("the notary must refuse a 32 KiB response budget");
     };
     // The rejection reaches the prover; it does not wait for a phase timeout.
@@ -374,6 +376,106 @@ async fn notary_rejects_oversized_transcript_budget() {
         elapsed < phase_timeout / 2,
         "took {elapsed:?} of a {phase_timeout:?} phase timeout"
     );
+}
+
+// ---- simulated MPC setup hang (the harness's diagnostics and retries) ---------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simulated_setup_hang_is_diagnosed_and_retried() {
+    // Two sessions stall, so the session that succeeds also shows that the
+    // notary freed the slots of the abandoned ones: it admits 2 per source
+    // address, and every harness connection comes from 127.0.0.1. Later
+    // sessions can still hit tlsn's real stall (often, on 4 CPUs), so they
+    // get the usual retries on top.
+    let stalls = 2;
+    let attempts = stalls + harness::default_attempts();
+    let scenario = Scenario {
+        stall_sessions: stalls,
+        attempts: Some(attempts),
+        phase_timeout: Some(Duration::from_secs(8)),
+        expect_failures: true,
+        ..Scenario::default()
+    };
+    let report = harness::run_report(Reply::ok(Framing::ContentLength), scenario).await;
+    // Shown with `--nocapture` or if the test fails.
+    for diagnostics in &report.failures {
+        eprintln!("{diagnostics}");
+    }
+    let run = report
+        .result
+        .expect("a session after the stalled ones succeeds");
+    assert!(run.attempts > stalls, "{} attempts", run.attempts);
+    assert_eq!(report.failures.len(), run.attempts as usize - 1);
+    for (i, diagnostics) in report.failures.iter().take(stalls as usize).enumerate() {
+        assert_stall_diagnostics(diagnostics, i + 1, attempts as usize);
+    }
+    let pv = verify(&run, &run.input).expect("claim verifies");
+    assert_honest_public_values(&run, &pv);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simulated_setup_hang_fails_after_the_last_attempt() {
+    let scenario = Scenario {
+        stall_sessions: u32::MAX,
+        attempts: Some(2),
+        phase_timeout: Some(Duration::from_secs(2)),
+        expect_failures: true,
+        ..Scenario::default()
+    };
+    let report = harness::run_report(Reply::ok(Framing::ContentLength), scenario).await;
+    for diagnostics in &report.failures {
+        eprintln!("{diagnostics}");
+    }
+    let Err(err) = report.result else {
+        panic!("every session stalls");
+    };
+    assert!(
+        matches!(
+            err,
+            ProverError::Timeout {
+                phase: "MPC setup",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(report.failures.len(), 2);
+    for (i, diagnostics) in report.failures.iter().enumerate() {
+        assert_stall_diagnostics(diagnostics, i + 1, 2);
+    }
+}
+
+/// The diagnostics of a stalled attempt name it and show where each side
+/// waits: the prover in tlsn's `commit` (MPC setup), the notary in `accept`
+/// (MPC preprocessing) of a session it admitted, both until the timeout.
+fn assert_stall_diagnostics(diagnostics: &str, attempt: usize, attempts: usize) {
+    let header = format!("attempt {attempt}/{attempts} failed: MPC setup timed out after");
+    assert!(diagnostics.contains(&header), "{diagnostics}");
+    let prover = section(diagnostics, "---- prover");
+    assert!(prover.contains("prover:commit"), "{diagnostics}");
+    let notary = section(diagnostics, "---- notary");
+    assert!(
+        notary.contains("orc_notary: session started"),
+        "{diagnostics}"
+    );
+    assert!(notary.contains("verifier:accept"), "{diagnostics}");
+    section(diagnostics, "---- other threads");
+    let idle = section(diagnostics, "---- spans that sat idle");
+    for span in [
+        "prover:commit: tlsn::prover: close",
+        "verifier:accept: tlsn::verifier: close",
+    ] {
+        assert!(idle.contains(span), "{span}:\n{diagnostics}");
+    }
+}
+
+/// The lines of one section of a diagnostics report.
+fn section<'a>(diagnostics: &'a str, header: &str) -> &'a str {
+    let start = diagnostics
+        .find(header)
+        .unwrap_or_else(|| panic!("no {header:?} section:\n{diagnostics}"));
+    let rest = &diagnostics[start + header.len()..];
+    &rest[..rest.find("\n----").unwrap_or(rest.len())]
 }
 
 // ---- fixtures for the SP1 guest (M2) ------------------------------------------

@@ -65,12 +65,43 @@ jobs:
       # which is a separate workspace. Verified in a clean rust:1.99.1-trixie
       # container without protoc or clang, capped at 4 CPUs / 16 GB.
       #
+      # Everything but orc-prover, in parallel. orc-prover's e2e suite runs
+      # real MPC sessions and gets its own step below.
+      - name: cargo test --workspace --exclude orc-prover --locked
+        run: cargo test --workspace --exclude orc-prover --locked
+
       # The e2e tests run real MPC-TLS sessions between the prover and the
       # notary against a local TLS server with tlsn's test CA. They are
       # offline and need no secrets. The real-GitHub fixture test skips itself
       # when fixtures/github-graphql-200.bin is absent.
-      - name: cargo test --workspace --locked
-        run: cargo test --workspace --locked
+      #
+      # Serialized (one test thread, one MPC session at a time). tlsn alpha.15
+      # stalls in MPC setup in roughly 1 of 3 sessions on 4 CPUs (README,
+      # "Known issues"); stalls look independent across retries. So more,
+      # shorter attempts than the harness defaults (3 x 45 s): a healthy
+      # phase takes <= 1.4 s on 4 CPUs, a stalled one never recovers, and
+      # 0.33^8 per test keeps a spurious failure well under 1% of runs.
+      # The harness prints the prover's and the notary's log tails for every
+      # failed attempt, even when a retry then passes; the full logs are
+      # uploaded in the next step.
+      - name: cargo test -p orc-prover (MPC e2e, serialized)
+        timeout-minutes: 25
+        env:
+          ORC_TEST_MPC_SLOTS: "1"
+          ORC_TEST_ATTEMPTS: "8"
+          ORC_TEST_PHASE_TIMEOUT_SECS: "15"
+          ORC_TEST_LOG_DIR: ${{ runner.temp }}/orc-e2e-logs
+        run: cargo test -p orc-prover --locked -- --test-threads=1
+
+      # Only exists if an MPC session attempt failed.
+      - name: Upload MPC e2e diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: orc-e2e-mpc-diagnostics
+          path: ${{ runner.temp }}/orc-e2e-logs
+          if-no-files-found: ignore
+          retention-days: 14
 
   contracts:
     name: forge fmt + build + test
