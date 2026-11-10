@@ -24,6 +24,7 @@ case itself is not new (see [Prior art](#prior-art-and-credits)).
 - [What gets checked](#what-gets-checked)
 - [Repository layout](#repository-layout)
 - [Quickstart (Docker dev environment)](#quickstart-docker-dev-environment)
+- [Local end-to-end demo (anvil)](#local-end-to-end-demo-anvil)
 - [Measured numbers](#measured-numbers)
 - [Milestones](#milestones)
 - [Known limitations and future work](#known-limitations-and-future-work)
@@ -207,10 +208,13 @@ cd orc-zktls-oracle
 # Already cloned without submodules? Run: git submodule update --init --recursive
 
 printf 'DEV_UID=%s\nDEV_GID=%s\n' "$(id -u)" "$(id -g)" > .env   # gitignored
+mkdir -p ~/.foundry/keystores   # bind-mounted for deploy keys; must exist BEFORE compose runs
 docker compose build
 ```
 
-The `.env` file makes files written by the container belong to you. Don't use
+The `.env` file makes files written by the container belong to you. `~/.foundry/keystores` is
+mounted into the container for encrypted Foundry keystores (testnet deployer); if it is missing,
+Docker creates it on the host owned by root. Don't use
 `UID=$(id -u) docker compose build`: `UID` is read-only in bash, so compose silently falls back
 to 1000. A cold build takes about 10 minutes and the image is about 9 GB.
 
@@ -255,7 +259,7 @@ docker compose run --rm -T dev bash -c 'cd crates/orc-script && cargo run --rele
 ```
 
 `vkey` should print
-`0x00cb041834ea77fe8b6f73a952c5ea7f9956a17d38746650ed481bc4952c7834`. If yours differs, you are
+`0x00b3387a75bade7018174d7e5a3b7da56c733ceda4dfe9ec0505c9b059e85dc6`. If yours differs, you are
 not building the same guest (different image, toolchain or `program/Cargo.lock`).
 
 `execute` exits 0 when the guest and the native verifier agree, whether both accept or both
@@ -320,6 +324,95 @@ This writes the contract fixture `fixtures/proofs/orc-production-groth16.json`
 artifacts into the `sp1-circuits` volume. Deploying `OrcClaim` (milestone M5) is driven by
 [`contracts/script/Deploy.s.sol`](contracts/script/Deploy.s.sol), whose header lists the
 environment variables it takes.
+
+## Local end-to-end demo (anvil)
+
+One command rehearses the M5 flow on a local chain, with a real GitHub session:
+
+```bash
+scripts/demo-local.sh
+```
+
+It needs `GITHUB_TOKEN` and `ORC_NOTARY_KEY` in `.env` (steps 2 and 3 of
+[A real GitHub run](#4-a-real-github-run-requires-a-token)). It runs everything in one dev
+container, so anvil, the notary and the prover share `localhost`:
+
+1. Builds `orc`, `orc-notary` and `orc-script`. This is a no-op on a warm cache.
+2. Starts anvil (chain id 31337) and `orc-notary` in the background. The accounts come from
+   anvil's public test mnemonic: #0 deploys and claims, #1 plays the attacker.
+3. Deploys `SP1MockVerifier`, then `OrcClaim` through `contracts/script/Deploy.s.sol`. The
+   inputs are:
+   - `programVKey` from `orc-script vkey`, computed at run time, so it always matches the guest
+     you built;
+   - `notaryKeyHash` as printed by the running notary;
+   - `campaignId = keccak256("orc-poc-github-v1")`;
+   - repo `felduque/orc-zktls-oracle` (databaseId 1452696697), threshold 5, `maxAge` 3600 s.
+
+   It then reads the configuration back from the chain.
+4. Runs `orc prove` against the real `api.github.com`, bound to anvil #0 and chain id 31337.
+5. Runs `orc-script fixture --mock --production`. The production guest executes on the
+   presentation, its output is compared with the native verifier, and the mock prover returns the
+   public values with an empty proof.
+6. anvil #1 submits the claim. It is mined and reverts with `WrongSender`, and the nullifier
+   stays unused.
+7. anvil #0 submits it. `Claimed` is emitted with the expected fields, and
+   `nullifierUsed(nullifier)` becomes `true`.
+8. anvil #0 submits it again. It reverts with `NullifierUsed`.
+
+The failing claims are sent with a fixed gas limit. That skips `eth_estimateGas`, so they are
+mined and revert on-chain (receipt status 0) rather than being refused by the RPC. The custom
+errors are decoded from the revert data. The script prints PASS/FAIL per step and exits non-zero
+on any unexpected result. It cleans up anvil, the notary and the container on exit, Ctrl-C
+included. Logs, the presentation, the mock fixture, the receipts and the deploy broadcast go to
+the gitignored `out/demo/`, which is wiped at the start of each run.
+
+```
+================ orc local demo: summary ================
+ 1  preconditions + build                    PASS    0.8 s  tokens present, binaries built
+ 2  anvil (31337) + orc-notary               PASS    0.2 s  anvil and notary up
+ 3  deploy SP1MockVerifier + OrcClaim        PASS    8.6 s  OrcClaim 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512, config read back OK
+ 4  orc prove (real api.github.com)          PASS    2.3 s  presentation 5740 B, native self-check OK
+ 5  orc-script fixture --mock --production   PASS    4.7 s  production guest accepted, publicValues match the deployment
+ 6  anvil #1 claims -> WrongSender           PASS    0.4 s  reverted on-chain with WrongSender
+ 7  anvil #0 claims -> Claimed               PASS    0.4 s  Claimed emitted, nullifier burnt
+ 8  anvil #0 replays -> NullifierUsed        PASS    0.4 s  reverted on-chain with NullifierUsed
+RESULT: PASS (8/8) in 17.8 s
+```
+
+**What it proves:**
+
+- The whole CLI flow works together on a real GitHub session: notary, MPC-TLS prover, the SP1
+  host running the production guest, and the deploy script.
+- The contract's semantics hold: the configuration the deploy script sets, the binding to
+  `msg.sender` and `block.chainid`, the `Claimed` event, and one claim per nullifier.
+
+**What it doesn't prove:**
+
+- There is no real proof. `SP1MockVerifier` accepts *any* public values with empty proof bytes,
+  so on this chain a forged `publicValues` would pass too. The guest's checks run only because
+  `orc-script` refuses to write a fixture the guest and native verifier don't both accept.
+- The real Groth16 path through the gateway is M4 and M5.
+
+**Cost and timing:**
+
+- **GitHub API.** Each run makes two GitHub GraphQL requests, the `viewer.id` preflight and the
+  notarized query. That's 2 points of the 5,000-point hourly GraphQL budget: `X-RateLimit-Used`
+  went from 4 to 6 between two runs. The script prints the budget from the notarized response
+  headers.
+- **Time.** A warm run takes about 18 s:
+  - about 9 s for the deploy step, which includes `orc-script vkey`;
+  - about 2 s for the MPC-TLS session;
+  - about 5 s for the mock fixture (SP1 setup plus the ~30M-instruction guest execute).
+- **First run.** It compiles sp1-sdk and both guests, which takes several minutes. After source
+  changes, expect about a minute of recompiling.
+
+To run it with your own token, point it at a repository where you have commits. The repo's
+`databaseId` is the `id` field of `https://api.github.com/repos/<owner>/<name>`.
+
+```bash
+ORC_DEMO_OWNER=you ORC_DEMO_NAME=repo ORC_DEMO_REPO_ID=<repo databaseId> ORC_DEMO_THRESHOLD=1 \
+  scripts/demo-local.sh
+```
 
 ## Measured numbers
 
@@ -387,7 +480,9 @@ Hardware for proving:
 ## Reproducibility
 
 The program vkey is a hash of the guest ELF, so anything that changes the guest build changes the
-vkey and requires redeploying `OrcClaim`. Everything that feeds it is pinned:
+vkey and requires redeploying `OrcClaim`. That includes pure reformatting of `program/` or
+`crates/orc-core`: panic locations (file:line:col) are compiled into the ELF. Everything that
+feeds it is pinned:
 
 - the Docker image (Rust 1.99.1, SP1 v6.10.0 + C toolchain, Go 1.26.10, Foundry v1.8.7);
 - the tlsn git tag `v0.1.0-alpha.15`;
@@ -398,8 +493,9 @@ That's why the repo has **no Dependabot config**: automated bumps of tlsn, SP1 o
 lockfile would silently change the vkey, and tlsn alpha tags break APIs. Bump by hand, rerun
 `vkey`, and redeploy.
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo test --workspace --locked`
-and `forge build` + `forge test`. It does not build the SP1 guest (too heavy for CI runners).
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `cargo fmt --check`,
+`cargo clippy -D warnings` and `cargo test --workspace --locked`, and `forge fmt --check`,
+`forge build` + `forge test`. It does not build the SP1 guest (too heavy for CI runners).
 
 ## Prior art and credits
 
